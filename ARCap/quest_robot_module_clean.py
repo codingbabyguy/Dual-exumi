@@ -159,6 +159,15 @@ class QuestRightArmLeapModule(QuestRobotModule):
         self.prev_data_dir = self.data_dir
         self.last_arm_q = None
         self.last_hand_q = None
+        self.latest_world_frame = None
+        self.latest_world_frame_ts = None
+
+    def _set_world_frame(self, world_frame, now):
+        """Store latest world frame for downstream batch-aware persistence."""
+        self.world_frame = world_frame
+        self.wf_receive_ts = now.strftime("%Y%m%d_%H%M%S")
+        self.latest_world_frame = world_frame.copy()
+        self.latest_world_frame_ts = self.wf_receive_ts
 
     def solve_arm_ik(self, wrist_pos, wrist_orn, wrist_offset=None):
         # Solve IK for the wrist position
@@ -273,6 +282,23 @@ class QuestRightArmLeapModule(QuestRobotModule):
         data, _ = self.wrist_listener_s.recvfrom(1024)
         data_string = data.decode()
         now = datetime.datetime.now()
+
+        # New Unity sender format: worldframe,x,y,z,qx,qy,qz,qw
+        if data_string.startswith("worldframe,"):
+            try:
+                data_list = [float(x) for x in data_string.split(",")[1:8]]
+                world_frame = np.array(data_list)
+                self._set_world_frame(world_frame, now)
+                print(
+                    "[VR] Received worldframe packet: "
+                    f"pos=({world_frame[0]:.4f}, {world_frame[1]:.4f}, {world_frame[2]:.4f}), "
+                    f"quat=({world_frame[3]:.4f}, {world_frame[4]:.4f}, {world_frame[5]:.4f}, {world_frame[6]:.4f}), "
+                    f"ts={self.latest_world_frame_ts}"
+                )
+                return None, None
+            except Exception:
+                print("[VR] Invalid worldframe packet received, ignored.")
+                return None, None
         
         # === 1. 保留原有的标准协议逻辑 ===
         if data_string.startswith("WorldFrame"):
@@ -280,8 +306,7 @@ class QuestRightArmLeapModule(QuestRobotModule):
             data_string = data_string.split(",")
             data_list = [float(data) for data in data_string]
             world_frame = np.array(data_list)
-            self.world_frame = world_frame
-            self.wf_receive_ts = now.strftime("%Y%m%d_%H%M%S")
+            self._set_world_frame(world_frame, now)
             os.makedirs(f"data/pose_{self.wf_receive_ts}", exist_ok=True)
             np.save(f"data/pose_{self.wf_receive_ts}/WorldFrame.npy", world_frame)
             return None, None
@@ -323,9 +348,8 @@ class QuestRightArmLeapModule(QuestRobotModule):
                     
                     # 核心逻辑：原地打桩！如果没有基准，就把这第一帧设为基准 WorldFrame
                     if not hasattr(self, 'world_frame'):
-                        self.world_frame = wrist_tf.copy() # 将初始物理位置设为 0点
-                        
-                        self.wf_receive_ts = now.strftime("%Y%m%d_%H%M%S")
+                        self._set_world_frame(wrist_tf.copy(), now) # 将初始物理位置设为 0点
+
                         os.makedirs(f"data/pose_{self.wf_receive_ts}", exist_ok=True)
                         np.save(f"data/pose_{self.wf_receive_ts}/WorldFrame.npy", self.world_frame)
                         print(f"\n🌟【打桩模式】已将按键瞬间的位置设为世界原点！")

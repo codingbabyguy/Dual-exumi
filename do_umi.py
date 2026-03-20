@@ -40,6 +40,27 @@ from ARCap.tactile_collection_process import TactileCollectionEnv, UsbCamera
 from multiprocessing.managers import SharedMemoryManager
 
 
+def save_worldframe_if_ready(quest: QuestRightArmLeapModule, save_dir: str, marker: dict):
+    """Save the latest worldframe only once into pose/worldframe_<ts>/WorldFrame.npy."""
+    if not save_dir:
+        return
+    world_frame = getattr(quest, "latest_world_frame", None)
+    world_ts = getattr(quest, "latest_world_frame_ts", None)
+    if world_frame is None or world_ts is None:
+        return
+    # Unity sends worldframe only once before the first batch.
+    # Keep a single persisted copy for the whole session.
+    if marker.get("saved"):
+        return
+
+    world_dir = os.path.join(save_dir, f"worldframe_{world_ts}")
+    os.makedirs(world_dir, exist_ok=True)
+    save_path = os.path.join(world_dir, "WorldFrame.npy")
+    np.save(save_path, world_frame)
+    marker["saved"] = True
+    print(f"[VR] WorldFrame saved successfully: {save_path}")
+
+
 # ---------- terminal utilities ----------
 class RawMode:
     """Context manager to put stdin into raw mode for single-key capture."""
@@ -138,6 +159,7 @@ def vr_worker(state: SharedState, stop_event: threading.Event, chunker: DataChun
     print("[VR] VR worker thread starting...")
     quest = QuestRightArmLeapModule(VR_HOST, LOCAL_HOST, POSE_CMD_PORT, IK_RESULT_PORT, vis_sp=None)
     last_tick = time.time()
+    worldframe_marker = {"saved": False, "last_pending_log": 0.0}
     try:
         while not stop_event.is_set():
             try:
@@ -146,11 +168,19 @@ def vr_worker(state: SharedState, stop_event: threading.Event, chunker: DataChun
                 print("[VR] Socket error, skipping...")
                 continue
 
+            snap = state.snapshot()
+            save_dir = snap["vr_dir"] if snap["batch_active"] else None
+            if save_dir:
+                if getattr(quest, "latest_world_frame", None) is None:
+                    now = time.time()
+                    if now - worldframe_marker["last_pending_log"] > 2.0:
+                        print("[VR] Batch active but worldframe not received yet, waiting...")
+                        worldframe_marker["last_pending_log"] = now
+                save_worldframe_if_ready(quest, save_dir, worldframe_marker)
+
             if wrist:
                 pos, quat = wrist
                 data = np.concatenate((pos, quat))
-                snap = state.snapshot()
-                save_dir = snap["vr_dir"] if snap["batch_active"] else None
                 chunker.put(data, save_dir)
                 if save_dir:
                     print(f"[VR] Data saved to batch: {save_dir} | Timestamp: {time.time():.2f}")
@@ -225,7 +255,7 @@ def main():
         dataset_name = datetime.now().strftime("session_%Y%m%d_%H%M%S")
     root_dir = os.path.join("data", dataset_name)
     os.makedirs(root_dir, exist_ok=True)
-            print(f"[MAIN] 主目录: {root_dir}")
+    print(f"[MAIN] 主目录: {root_dir}")
     print("[MAIN] 数据将按照以下结构组织:")
     print("  batch_1/")
     print("  ├── pose/               # VR姿态数据 (.npz文件)")
