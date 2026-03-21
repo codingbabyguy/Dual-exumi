@@ -155,9 +155,21 @@ class SharedState:
 
 
 # ---------- worker threads ----------
-def vr_worker(state: SharedState, stop_event: threading.Event, chunker: DataChunker, freq_hz: int = 30):
+def vr_worker(
+    state: SharedState,
+    stop_event: threading.Event,
+    chunker: DataChunker,
+    freq_hz: int = 30,
+    startup_calibration: dict = None,
+):
     print("[VR] VR worker thread starting...")
     quest = QuestRightArmLeapModule(VR_HOST, LOCAL_HOST, POSE_CMD_PORT, IK_RESULT_PORT, vis_sp=None)
+    if startup_calibration is not None:
+        quest.set_manual_calibration(
+            startup_calibration["origin"],
+            startup_calibration["rotation"],
+        )
+        print("[VR] Startup calibration applied in VR worker.")
     last_tick = time.time()
     worldframe_marker = {"saved": False, "last_pending_log": 0.0}
     try:
@@ -256,6 +268,22 @@ def main():
     root_dir = os.path.join("data", dataset_name)
     os.makedirs(root_dir, exist_ok=True)
     print(f"[MAIN] 主目录: {root_dir}")
+    print("[MAIN] 进入启动标定流程（Origin, +X, +Y, +Z验证）...")
+
+    calib_result = None
+    calib_quest = QuestRightArmLeapModule(VR_HOST, LOCAL_HOST, POSE_CMD_PORT, IK_RESULT_PORT, vis_sp=None)
+    try:
+        calib_quest.run_axis_calibration(min_move=0.03)
+        if calib_quest.manual_origin is not None and calib_quest.manual_rotation is not None:
+            calib_result = {
+                "origin": calib_quest.manual_origin.copy(),
+                "rotation": calib_quest.manual_rotation.copy(),
+            }
+            print("[MAIN] 启动标定完成，将在后续采集中使用该 worldframe。")
+        else:
+            print("[MAIN] 标定未成功，将回退到原有 worldframe/打桩逻辑。")
+    finally:
+        calib_quest.close()
     print("[MAIN] 数据将按照以下结构组织:")
     print("  batch_1/")
     print("  ├── pose/               # VR姿态数据 (.npz文件)")
@@ -268,7 +296,12 @@ def main():
     stop_event = threading.Event()
     chunker = DataChunker(chunksize=600)
 
-    vr_thread = threading.Thread(target=vr_worker, args=(state, stop_event, chunker), daemon=True)
+    vr_thread = threading.Thread(
+        target=vr_worker,
+        args=(state, stop_event, chunker),
+        kwargs={"freq_hz": 30, "startup_calibration": calib_result},
+        daemon=True,
+    )
     tactile_thread = threading.Thread(target=tactile_worker, args=(state, stop_event), daemon=True)
     vr_thread.start()
     tactile_thread.start()

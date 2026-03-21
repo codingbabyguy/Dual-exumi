@@ -161,6 +161,8 @@ class QuestRightArmLeapModule(QuestRobotModule):
         self.last_hand_q = None
         self.latest_world_frame = None
         self.latest_world_frame_ts = None
+        self.manual_origin = None
+        self.manual_rotation = None
 
     def _set_world_frame(self, world_frame, now):
         """Store latest world frame for downstream batch-aware persistence."""
@@ -168,6 +170,122 @@ class QuestRightArmLeapModule(QuestRobotModule):
         self.wf_receive_ts = now.strftime("%Y%m%d_%H%M%S")
         self.latest_world_frame = world_frame.copy()
         self.latest_world_frame_ts = self.wf_receive_ts
+
+    def set_manual_calibration(self, origin, rotation_matrix, now=None):
+        """Apply a manually calibrated frame and expose it as worldframe metadata."""
+        if now is None:
+            now = datetime.datetime.now()
+        self.manual_origin = np.asarray(origin, dtype=float).copy()
+        self.manual_rotation = np.asarray(rotation_matrix, dtype=float).copy()
+        world_quat = Rotation.from_matrix(self.manual_rotation).as_quat()
+        world_frame = np.hstack([self.manual_origin, world_quat])
+        self._set_world_frame(world_frame, now)
+        print(
+            "[VR][CALIB] Manual worldframe ready: "
+            f"origin=({self.manual_origin[0]:.4f}, {self.manual_origin[1]:.4f}, {self.manual_origin[2]:.4f}), "
+            f"quat=({world_quat[0]:.4f}, {world_quat[1]:.4f}, {world_quat[2]:.4f}, {world_quat[3]:.4f})"
+        )
+
+    @staticmethod
+    def _parse_ee_pose(data_string):
+        if not data_string.startswith("EE,"):
+            return None
+        parts = data_string.split(",")
+        if len(parts) < 9:
+            return None
+        try:
+            return np.array([float(x) for x in parts[2:9]], dtype=float)
+        except Exception:
+            return None
+
+    def _recv_ee_pose_blocking(self):
+        while True:
+            data, _ = self.wrist_listener_s.recvfrom(1024)
+            pose = self._parse_ee_pose(data.decode())
+            if pose is not None:
+                return pose
+
+    @staticmethod
+    def _normalize(v):
+        n = np.linalg.norm(v)
+        if n < 1e-8:
+            raise ValueError("Vector norm is too small for normalization")
+        return v / n
+
+    @classmethod
+    def _build_calibrated_rotation(cls, p0, px, py, pz=None):
+        x_raw = px - p0
+        y_raw = py - p0
+        x_hat = cls._normalize(x_raw)
+        y_ortho = y_raw - np.dot(y_raw, x_hat) * x_hat
+        y_hat = cls._normalize(y_ortho)
+        z_hat = cls._normalize(np.cross(x_hat, y_hat))
+        if pz is not None:
+            z_raw = pz - p0
+            if np.linalg.norm(z_raw) > 1e-8 and np.dot(z_hat, z_raw) < 0:
+                z_hat = -z_hat
+        y_hat = cls._normalize(np.cross(z_hat, x_hat))
+        rot = np.column_stack([x_hat, y_hat, z_hat])
+        if np.linalg.det(rot) < 0:
+            z_hat = -z_hat
+            y_hat = cls._normalize(np.cross(z_hat, x_hat))
+            rot = np.column_stack([x_hat, y_hat, z_hat])
+        return rot
+
+    def run_axis_calibration(self, min_move=0.03):
+        """Interactive calibration using origin, +X, +Y, +Z guidance based on EE packets."""
+        print("[VR][CALIB] Axis calibration started.")
+        print("[VR][CALIB] Keep controller steady, waiting for initial EE pose...")
+        origin_pose = self._recv_ee_pose_blocking()
+        p0 = origin_pose[:3]
+        print(f"[VR][CALIB] Origin captured: ({p0[0]:.4f}, {p0[1]:.4f}, {p0[2]:.4f})")
+
+        while True:
+            input("[VR][CALIB] Move toward +X, then press Enter to sample... ")
+            px = self._recv_ee_pose_blocking()[:3]
+            dx = np.linalg.norm(px - p0)
+            if dx >= min_move:
+                print(f"[VR][CALIB] +X sample accepted, move={dx:.4f} m")
+                break
+            print(f"[VR][CALIB] +X move too small ({dx:.4f} m), please retry.")
+
+        while True:
+            input("[VR][CALIB] Move toward +Y, then press Enter to sample... ")
+            py = self._recv_ee_pose_blocking()[:3]
+            dy = np.linalg.norm(py - p0)
+            if dy >= min_move:
+                print(f"[VR][CALIB] +Y sample accepted, move={dy:.4f} m")
+                break
+            print(f"[VR][CALIB] +Y move too small ({dy:.4f} m), please retry.")
+
+        while True:
+            input("[VR][CALIB] Move toward +Z (for sign check), then press Enter to sample... ")
+            pz = self._recv_ee_pose_blocking()[:3]
+            dz = np.linalg.norm(pz - p0)
+            if dz >= min_move:
+                print(f"[VR][CALIB] +Z verification sample accepted, move={dz:.4f} m")
+                break
+            print(f"[VR][CALIB] +Z move too small ({dz:.4f} m), please retry.")
+
+        rot = self._build_calibrated_rotation(p0, px, py, pz)
+        self.set_manual_calibration(p0, rot)
+
+        x_axis, y_axis, z_axis = rot[:, 0], rot[:, 1], rot[:, 2]
+        xy_deg = np.degrees(np.arccos(np.clip(np.dot(x_axis, y_axis), -1.0, 1.0)))
+        xz_deg = np.degrees(np.arccos(np.clip(np.dot(x_axis, z_axis), -1.0, 1.0)))
+        yz_deg = np.degrees(np.arccos(np.clip(np.dot(y_axis, z_axis), -1.0, 1.0)))
+        print(
+            "[VR][CALIB] Done. Axis angles (deg): "
+            f"X-Y={xy_deg:.2f}, X-Z={xz_deg:.2f}, Y-Z={yz_deg:.2f}"
+        )
+
+    def _compute_rel_transform_manual(self, pose):
+        pos = np.asarray(pose[:3], dtype=float)
+        quat = np.asarray(pose[3:], dtype=float)
+        rel_pos = self.manual_rotation.T @ (pos - self.manual_origin)
+        rel_rot_mat = self.manual_rotation.T @ Rotation.from_quat(quat).as_matrix()
+        rel_quat = Rotation.from_matrix(rel_rot_mat).as_quat()
+        return rel_pos, rel_quat
 
     def solve_arm_ik(self, wrist_pos, wrist_orn, wrist_offset=None):
         # Solve IK for the wrist position
@@ -346,13 +464,20 @@ class QuestRightArmLeapModule(QuestRobotModule):
                     data_list = [float(x) for x in parts[2:9]]
                     wrist_tf = np.array(data_list)
                     
-                    # 核心逻辑：原地打桩！如果没有基准，就把这第一帧设为基准 WorldFrame
-                    if not hasattr(self, 'world_frame'):
-                        self._set_world_frame(wrist_tf.copy(), now) # 将初始物理位置设为 0点
+                    if self.manual_rotation is not None and self.manual_origin is not None:
+                        rel_wrist_pos, rel_wrist_rot = self._compute_rel_transform_manual(wrist_tf)
+                    else:
+                        # 核心逻辑：原地打桩！如果没有基准，就把这第一帧设为基准 WorldFrame
+                        if not hasattr(self, 'world_frame'):
+                            self._set_world_frame(wrist_tf.copy(), now) # 将初始物理位置设为 0点
 
-                        os.makedirs(f"data/pose_{self.wf_receive_ts}", exist_ok=True)
-                        np.save(f"data/pose_{self.wf_receive_ts}/WorldFrame.npy", self.world_frame)
-                        print(f"\n🌟【打桩模式】已将按键瞬间的位置设为世界原点！")
+                            os.makedirs(f"data/pose_{self.wf_receive_ts}", exist_ok=True)
+                            np.save(f"data/pose_{self.wf_receive_ts}/WorldFrame.npy", self.world_frame)
+                            print(f"\n🌟【打桩模式】已将按键瞬间的位置设为世界原点！")
+
+                        # 计算相对位移：利用原代码自带的矩阵转换函数
+                        # 注意：你录制的第一帧，算出来必定是 [0,0,0]，之后每一帧都是纯粹的相对运动
+                        rel_wrist_pos, rel_wrist_rot = self.compute_rel_transform(wrist_tf)
 
                     # 自动触发 Start：创建存放 npz 数据块的子目录
                     if self.data_dir is None:
@@ -360,10 +485,6 @@ class QuestRightArmLeapModule(QuestRobotModule):
                         self.data_dir = f"data/pose_{self.wf_receive_ts}/{formatted_time}"
                         os.makedirs(self.data_dir, exist_ok=True)
                         print(f"🎬 开始录制相对轨迹数据 -> {self.data_dir}")
-
-                    # 计算相对位移：利用原代码自带的矩阵转换函数
-                    # 注意：你录制的第一帧，算出来必定是 [0,0,0]，之后每一帧都是纯粹的相对运动
-                    rel_wrist_pos, rel_wrist_rot = self.compute_rel_transform(wrist_tf)
                     
                     # 补充虚拟头部数据，防止主程序 unpack 拆包时报错
                     rel_head_pos = np.array([0.0, 0.0, 0.0])

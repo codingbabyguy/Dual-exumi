@@ -179,6 +179,11 @@ if __name__ == "__main__":
         default=115200,
         help="串口波特率"
     )
+    parser.add_argument(
+        "--axis_calibration",
+        action="store_true",
+        help="启动后先进行交互式 XYZ 轴标定（origin,+X,+Y,+Z验证）"
+    )
     args = parser.parse_args()
 
     # 初始化 PyBullet 仿真环境
@@ -199,6 +204,11 @@ if __name__ == "__main__":
     quest = QuestRightArmLeapModule(
         VR_HOST, LOCAL_HOST, POSE_CMD_PORT, IK_RESULT_PORT, vis_sp=None
     )
+
+    if args.axis_calibration:
+        print("[MAIN] 启动交互式轴标定流程...")
+        quest.run_axis_calibration(min_move=0.03)
+        print("[MAIN] 轴标定完成，后续位姿将转换到该标定 worldframe。")
 
     # 性能统计变量
     start_time = time.time()  # 用于计算每秒接收数据包数
