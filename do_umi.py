@@ -18,6 +18,7 @@ Behavior:
 import os
 import sys
 import time
+import errno
 import threading
 import select
 import tty
@@ -159,17 +160,11 @@ def vr_worker(
     state: SharedState,
     stop_event: threading.Event,
     chunker: DataChunker,
+    quest: QuestRightArmLeapModule,
     freq_hz: int = 30,
-    startup_calibration: dict = None,
 ):
     print("[VR] VR worker thread starting...")
-    quest = QuestRightArmLeapModule(VR_HOST, LOCAL_HOST, POSE_CMD_PORT, IK_RESULT_PORT, vis_sp=None)
-    if startup_calibration is not None:
-        quest.set_manual_calibration(
-            startup_calibration["origin"],
-            startup_calibration["rotation"],
-        )
-        print("[VR] Startup calibration applied in VR worker.")
+    print("[VR] Reusing calibrated Quest socket for data collection.")
     last_tick = time.time()
     worldframe_marker = {"saved": False, "last_pending_log": 0.0}
     try:
@@ -270,20 +265,24 @@ def main():
     print(f"[MAIN] 主目录: {root_dir}")
     print("[MAIN] 进入启动标定流程（Origin, +X, +Y, +Z验证）...")
 
-    calib_result = None
-    calib_quest = QuestRightArmLeapModule(VR_HOST, LOCAL_HOST, POSE_CMD_PORT, IK_RESULT_PORT, vis_sp=None)
     try:
-        calib_quest.run_axis_calibration(min_move=0.03)
-        if calib_quest.manual_origin is not None and calib_quest.manual_rotation is not None:
-            calib_result = {
-                "origin": calib_quest.manual_origin.copy(),
-                "rotation": calib_quest.manual_rotation.copy(),
-            }
+        quest = QuestRightArmLeapModule(VR_HOST, LOCAL_HOST, POSE_CMD_PORT, IK_RESULT_PORT, vis_sp=None)
+    except OSError as e:
+        if e.errno == errno.EADDRINUSE:
+            print(
+                f"[MAIN][ERROR] 端口 {POSE_CMD_PORT} 已被占用，请先关闭其它采集进程后重试。"
+            )
+            return
+        raise
+    try:
+        quest.run_axis_calibration(min_move=0.03)
+        if quest.manual_origin is not None and quest.manual_rotation is not None:
             print("[MAIN] 启动标定完成，将在后续采集中使用该 worldframe。")
         else:
             print("[MAIN] 标定未成功，将回退到原有 worldframe/打桩逻辑。")
-    finally:
-        calib_quest.close()
+    except Exception:
+        quest.close()
+        raise
     print("[MAIN] 数据将按照以下结构组织:")
     print("  batch_1/")
     print("  ├── pose/               # VR姿态数据 (.npz文件)")
@@ -298,8 +297,8 @@ def main():
 
     vr_thread = threading.Thread(
         target=vr_worker,
-        args=(state, stop_event, chunker),
-        kwargs={"freq_hz": 30, "startup_calibration": calib_result},
+        args=(state, stop_event, chunker, quest),
+        kwargs={"freq_hz": 30},
         daemon=True,
     )
     tactile_thread = threading.Thread(target=tactile_worker, args=(state, stop_event), daemon=True)
