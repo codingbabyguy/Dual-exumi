@@ -172,7 +172,11 @@ class QuestRightArmLeapModule(QuestRobotModule):
         self.latest_world_frame_ts = self.wf_receive_ts
 
     def set_manual_calibration(self, origin, rotation_matrix, now=None):
-        """Apply a manually calibrated frame and expose it as worldframe metadata."""
+        """Apply a manually calibrated frame and expose it as worldframe metadata.
+        
+        重要：保存的所有相对pose数据都是相对于这个 manual_origin 和 manual_rotation。
+        可视化时必须使用同样的参数来还原绝对位置。
+        """
         if now is None:
             now = datetime.datetime.now()
         self.manual_origin = np.asarray(origin, dtype=float).copy()

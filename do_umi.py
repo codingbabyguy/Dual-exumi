@@ -27,6 +27,7 @@ import socket
 from datetime import datetime
 
 import numpy as np
+import pybullet as pb
 
 from ARCap.data_collection_umi import DataChunker
 from ARCap.quest_robot_module_clean import QuestRightArmLeapModule
@@ -257,6 +258,11 @@ def tactile_worker(state: SharedState, stop_event: threading.Event, save_interva
 
 # ---------- main ----------
 def main():
+    physics_client = None
+    if not pb.isConnected():
+        physics_client = pb.connect(pb.DIRECT)
+        print(f"[MAIN] PyBullet connected (client_id={physics_client}).")
+
     dataset_name = input("请输入采集名称(文件夹名): ").strip()
     if not dataset_name:
         dataset_name = datetime.now().strftime("session_%Y%m%d_%H%M%S")
@@ -266,72 +272,86 @@ def main():
     print("[MAIN] 进入启动标定流程（Origin, +X, +Y, +Z验证）...")
 
     try:
-        quest = QuestRightArmLeapModule(VR_HOST, LOCAL_HOST, POSE_CMD_PORT, IK_RESULT_PORT, vis_sp=None)
-    except OSError as e:
-        if e.errno == errno.EADDRINUSE:
-            print(
-                f"[MAIN][ERROR] 端口 {POSE_CMD_PORT} 已被占用，请先关闭其它采集进程后重试。"
-            )
-            return
-        raise
-    try:
-        quest.run_axis_calibration(min_move=0.03)
-        if quest.manual_origin is not None and quest.manual_rotation is not None:
-            print("[MAIN] 启动标定完成，将在后续采集中使用该 worldframe。")
-        else:
-            print("[MAIN] 标定未成功，将回退到原有 worldframe/打桩逻辑。")
-    except Exception:
-        quest.close()
-        raise
-    print("[MAIN] 数据将按照以下结构组织:")
-    print("  batch_1/")
-    print("  ├── pose/               # VR姿态数据 (.npz文件)")
-    print("  ├── tactile_YYYYMMDD_HHMMSS/  # 触觉数据文件夹")
-    print("  ├── latency_calibration/ # 标定视频(预留)")
-    print("  └── raw_videos/         # 原始视频(预留)")
-    print("[MAIN] 按 'w' 开始batch, 'e' 结束当前batch, 'q' 退出")
-
-    state = SharedState(root_dir)
-    stop_event = threading.Event()
-    chunker = DataChunker(chunksize=600)
-
-    vr_thread = threading.Thread(
-        target=vr_worker,
-        args=(state, stop_event, chunker, quest),
-        kwargs={"freq_hz": 30},
-        daemon=True,
-    )
-    tactile_thread = threading.Thread(target=tactile_worker, args=(state, stop_event), daemon=True)
-    vr_thread.start()
-    tactile_thread.start()
-    print("[MAIN] VR和Tactile采集线程已启动。")
-
-    with RawMode():
         try:
-            while True:
-                key = read_key(timeout=0.1)
-                if key is None:
-                    continue
-                if key == "w":
-                    batch_dir = state.start_batch()
-                    if batch_dir:
-                        print(f"[MAIN] 开始 batch: {batch_dir}")
-                elif key == "e":
-                    finished_dir = state.end_batch()
-                    if finished_dir:
-                        if chunker.last_save_dir is not None:
-                            print("[MAIN] Flushing VR chunk for batch end...")
-                            chunker.save_and_reset()
-                        print(f"[MAIN] 结束 batch: {finished_dir}")
-                elif key == "q":
-                    print("[MAIN] 退出中...")
-                    break
-        finally:
-            stop_event.set()
-            print("[MAIN] 等待采集线程退出...")
-            vr_thread.join()
-            tactile_thread.join()
-    print("[MAIN] 采集完成。")
+            quest = QuestRightArmLeapModule(VR_HOST, LOCAL_HOST, POSE_CMD_PORT, IK_RESULT_PORT, vis_sp=None)
+        except OSError as e:
+            if e.errno == errno.EADDRINUSE:
+                print(
+                    f"[MAIN][ERROR] 端口 {POSE_CMD_PORT} 已被占用，请先关闭其它采集进程后重试。"
+                )
+                return
+            raise
+        try:
+            quest.run_axis_calibration(min_move=0.03)
+            if quest.manual_origin is not None and quest.manual_rotation is not None:
+                print("[MAIN] 启动标定完成，将在后续采集中使用该 worldframe。")
+                # 🔧 保存标定参数到根目录，用于可视化验证
+                calib_file = os.path.join(root_dir, "calibration_params.npz")
+                np.savez(
+                    calib_file,
+                    manual_origin=quest.manual_origin,
+                    manual_rotation=quest.manual_rotation,
+                    calibration_timestamp=datetime.now().isoformat()
+                )
+                print(f"[MAIN] ✅ 标定参数已保存: {calib_file}")
+            else:
+                print("[MAIN] 标定未成功，将回退到原有 worldframe/打桩逻辑。")
+        except Exception:
+            quest.close()
+            raise
+        print("[MAIN] 数据将按照以下结构组织:")
+        print("  batch_1/")
+        print("  ├── pose/               # VR姿态数据 (.npz文件)")
+        print("  ├── tactile_YYYYMMDD_HHMMSS/  # 触觉数据文件夹")
+        print("  ├── latency_calibration/ # 标定视频(预留)")
+        print("  └── raw_videos/         # 原始视频(预留)")
+        print("[MAIN] 按 'w' 开始batch, 'e' 结束当前batch, 'q' 退出")
+
+        state = SharedState(root_dir)
+        stop_event = threading.Event()
+        chunker = DataChunker(chunksize=600)
+
+        vr_thread = threading.Thread(
+            target=vr_worker,
+            args=(state, stop_event, chunker, quest),
+            kwargs={"freq_hz": 30},
+            daemon=True,
+        )
+        tactile_thread = threading.Thread(target=tactile_worker, args=(state, stop_event), daemon=True)
+        vr_thread.start()
+        tactile_thread.start()
+        print("[MAIN] VR和Tactile采集线程已启动。")
+
+        with RawMode():
+            try:
+                while True:
+                    key = read_key(timeout=0.1)
+                    if key is None:
+                        continue
+                    if key == "w":
+                        batch_dir = state.start_batch()
+                        if batch_dir:
+                            print(f"[MAIN] 开始 batch: {batch_dir}")
+                    elif key == "e":
+                        finished_dir = state.end_batch()
+                        if finished_dir:
+                            if chunker.last_save_dir is not None:
+                                print("[MAIN] Flushing VR chunk for batch end...")
+                                chunker.save_and_reset()
+                            print(f"[MAIN] 结束 batch: {finished_dir}")
+                    elif key == "q":
+                        print("[MAIN] 退出中...")
+                        break
+            finally:
+                stop_event.set()
+                print("[MAIN] 等待采集线程退出...")
+                vr_thread.join()
+                tactile_thread.join()
+        print("[MAIN] 采集完成。")
+    finally:
+        if physics_client is not None and pb.isConnected():
+            pb.disconnect(physics_client)
+            print("[MAIN] PyBullet disconnected.")
 
 
 if __name__ == "__main__":
