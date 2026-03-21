@@ -19,9 +19,16 @@ import time
 from argparse import ArgumentParser
 import pybullet as pb
 import numpy as np
-from ip_config import *
-from quest_robot_module_clean import QuestRightArmLeapModule
 from scipy.spatial.transform import Rotation as R
+
+try:
+    # Package import path (used by do_umi.py)
+    from ARCap.ip_config import *
+    from ARCap.quest_robot_module_clean import QuestRightArmLeapModule
+except ModuleNotFoundError:
+    # Direct script execution path (used by `python ARCap/data_collection_umi.py`)
+    from ip_config import *
+    from quest_robot_module_clean import QuestRightArmLeapModule
 
 
 
