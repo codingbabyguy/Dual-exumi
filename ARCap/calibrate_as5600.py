@@ -3,7 +3,7 @@ import time
 import json
 
 DEVICE_AS5600 = 0x36
-bus = smbus.SMBus(2)
+bus = smbus.SMBus(1)
 
 def ReadRawAngle():
     try:
