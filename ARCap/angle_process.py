@@ -4,18 +4,26 @@ sys.path.append('/home/xuyue/tactile_umi_grav/ARCap')
 import smbus
 import time
 import numpy as np
-from ip_config import *
+#from ip_config import *
 import pybullet as pb
 from threadpoolctl import threadpool_limits
 from multiprocessing.managers import SharedMemoryManager
 from umi.common.timestamp_accumulator import get_accumulate_timestamp_idxs
 from umi.shared_memory.shared_memory_ring_buffer import SharedMemoryRingBuffer
 from umi.shared_memory.shared_memory_queue import SharedMemoryQueue, Full, Empty
+try:
+    # Package import path (used by do_umi.py)
+    from ARCap.ip_config import *
+    from ARCap.quest_robot_module_clean import QuestRightArmLeapModule
+except ModuleNotFoundError:
+    # Direct script execution path (used by `python ARCap/data_collection_umi.py`)
+    from ip_config import *
+    from quest_robot_module_clean import QuestRightArmLeapModule
 
-from quest_robot_module_clean import QuestRightArmLeapModule
+#from quest_robot_module_clean import QuestRightArmLeapModule
 
 DEVICE_AS5600 = 0x36  # Default device I2C address
-AS5600_BUS = smbus.SMBus(2)
+AS5600_BUS = smbus.SMBus(1)
 
 def read_rotary_angle():  # Read angle (0-360 represented as 0-4096)
     read_bytes = AS5600_BUS.read_i2c_block_data(DEVICE_AS5600, 0x0C, 2)

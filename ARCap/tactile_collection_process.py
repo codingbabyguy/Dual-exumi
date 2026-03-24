@@ -10,6 +10,17 @@ import threading
 
 from .ip_config import TACTILE_CAMERA
 
+
+def _fmt_ts(ts):
+    return f"{ts:.6f}" if ts is not None else "None"
+
+
+def _safe_len(x):
+    try:
+        return len(x)
+    except Exception:
+        return 0
+
 class TactileCollectionEnv:
     def __init__(self, camera_dev_path_dict, save_dir, shm_manager,S_N, *, 
                         resolution=(640, 480), fps=30, buffer_size=350):
@@ -99,20 +110,68 @@ class TactileCollectionEnv:
         assert self.is_ready
 
         start_time = time.monotonic()
+        print(f"[COLLECT] ===== Step {self.global_step} begin | save_dir={self.save_dir} =====")
  
         
         for camera_name, camera in self.camera_dict.items():
-            print("Fetching data", camera_name)
+            print(f"[CAMERA] Fetching data: {camera_name}")
             self.last_camera_data[camera_name] = camera.get_all()
-            print("Takes", time.monotonic()-start_time)
+            camera_data = self.last_camera_data[camera_name]
+            if camera_data is None:
+                print(f"[CAMERA][WARN] {camera_name}: get_all() returned None")
+            else:
+                frame_count = _safe_len(camera_data.get('color', []))
+                ts = camera_data.get('timestamp', [])
+                ts_count = _safe_len(ts)
+                if ts_count > 0:
+                    first_ts = float(ts[0])
+                    last_ts = float(ts[-1])
+                    print(
+                        f"[CAMERA] {camera_name}: frames={frame_count}, timestamps={ts_count}, "
+                        f"range=[{_fmt_ts(first_ts)}, {_fmt_ts(last_ts)}], "
+                        f"span={last_ts - first_ts:.3f}s"
+                    )
+                else:
+                    print(f"[CAMERA][WARN] {camera_name}: empty timestamp list")
+            print(f"[COLLECT] elapsed={time.monotonic()-start_time:.3f}s")
         
 
         
-        print("Fetching angle data")
+        print("[ANGLE] Fetching angle data")
         self.last_angle_data = self.angle_sensor.get_all()
+
+        if self.last_angle_data is None:
+            print("[ANGLE][WARN] No angle data received in this step (get_all returned None)")
+        else:
+            angles = self.last_angle_data.get('angle', [])
+            poses = self.last_angle_data.get('data', [])
+            timestamps = self.last_angle_data.get('timestamp', [])
+            n_angles = _safe_len(angles)
+            n_poses = _safe_len(poses)
+            n_ts = _safe_len(timestamps)
+
+            print(f"[ANGLE] Received samples: angles={n_angles}, poses={n_poses}, timestamps={n_ts}")
+
+            if n_ts > 0:
+                first_ts = float(timestamps[0])
+                last_ts = float(timestamps[-1])
+                print(
+                    f"[ANGLE] Time range=[{_fmt_ts(first_ts)}, {_fmt_ts(last_ts)}], "
+                    f"span={last_ts - first_ts:.3f}s"
+                )
+
+            if n_angles > 0:
+                angle_vals = [int(a[0]) if hasattr(a, '__len__') else int(a) for a in angles]
+                print(
+                    f"[ANGLE] Angle stats: min={min(angle_vals)}, max={max(angle_vals)}, "
+                    f"first={angle_vals[0]}, last={angle_vals[-1]}"
+                )
+
+            if n_angles == 0 or n_poses == 0 or n_ts == 0:
+                print("[ANGLE][WARN] Incomplete angle payload; angle_*.json may be skipped or invalid")
         
             
-        print("Takes", time.monotonic() - start_time)
+        print(f"[COLLECT] elapsed={time.monotonic() - start_time:.3f}s")
         threads = []
         for camera_name, camera_data in self.last_camera_data.items():
             
@@ -124,18 +183,27 @@ class TactileCollectionEnv:
             angle_thread = threading.Thread(target=self._save_angle_data, args=(self.last_angle_data,))
             threads.append(angle_thread)
             angle_thread.start()
+        else:
+            print(f"[ANGLE][WARN] Skip angle save for step {self.global_step}: no data")
         
         for thread in threads:
             thread.join()
-        print("Takes", time.monotonic() - start_time)
+        print(f"[COLLECT] ===== Step {self.global_step} done | elapsed={time.monotonic() - start_time:.3f}s =====")
         
         self.global_step += 1
         self.last_camera_data = {k: None for k in self.camera_dict.keys()}
 
     def _save_video_and_json(self, camera_name, camera_data):
         start_time = time.monotonic()
+        if camera_data is None:
+            print(f"[SAVE][CAMERA][WARN] {camera_name}: camera_data is None, skip save")
+            return
+
+        video_path = os.path.join(self.save_dir, f"{camera_name}_{self.global_step}.mp4")
+        json_path = os.path.join(self.save_dir, f"{camera_name}_{self.global_step}.json")
+
         video_writer = cv2.VideoWriter(
-            os.path.join(self.save_dir, f"{camera_name}_{self.global_step}.mp4"),
+            video_path,
             cv2.VideoWriter_fourcc(*'mp4v'),
             self.fps, self.resolution)
 
@@ -147,11 +215,19 @@ class TactileCollectionEnv:
             video_writer.write(frame)
         video_writer.release()
 
-        with open(os.path.join(self.save_dir, f"{camera_name}_{self.global_step}.json"), 'w') as json_file:
+        with open(json_path, 'w') as json_file:
             timestamps = camera_data["timestamp"].tolist()
             json.dump(timestamps, json_file)
 
-        print("Saved camera data")
+        frame_count = _safe_len(camera_data["color"])
+        if len(timestamps) > 0:
+            print(
+                f"[SAVE][CAMERA] {camera_name}: saved {frame_count} frames -> {video_path}; "
+                f"timestamps -> {json_path}; range=[{_fmt_ts(timestamps[0])}, {_fmt_ts(timestamps[-1])}]"
+            )
+        else:
+            print(f"[SAVE][CAMERA][WARN] {camera_name}: saved empty timestamp list -> {json_path}")
+        print(f"[SAVE][CAMERA] {camera_name}: done in {time.monotonic() - start_time:.3f}s")
 
     def _save_realsense_video_and_json(self, camera_name, camera_data):
         start_time = time.monotonic()
@@ -182,12 +258,24 @@ class TactileCollectionEnv:
     
     def _save_angle_data(self, angle_data):
         start_time = time.monotonic()
-        with open(os.path.join(self.save_dir, f"angle_{self.global_step}.json"), 'w') as json_file:
+        angle_path = os.path.join(self.save_dir, f"angle_{self.global_step}.json")
+
+        with open(angle_path, 'w') as json_file:
             angles = angle_data['angle'].tolist()
             data = angle_data['data'].tolist()
             timestamps = angle_data["timestamp"].tolist()
             json.dump({'angles': angles, 'data':data, 'timestamps': timestamps}, json_file)
-        print("\033[92m Successfully saved angle&pose data \033[0m")
+        n = len(timestamps)
+        if n > 0:
+            angle_vals = [int(a[0]) if hasattr(a, '__len__') else int(a) for a in angles]
+            print(
+                f"\033[92m[SAVE][ANGLE] saved {n} samples -> {angle_path}; "
+                f"time=[{_fmt_ts(timestamps[0])}, {_fmt_ts(timestamps[-1])}], "
+                f"angle[min={min(angle_vals)}, max={max(angle_vals)}]\033[0m"
+            )
+        else:
+            print(f"\033[93m[SAVE][ANGLE][WARN] wrote empty angle file -> {angle_path}\033[0m")
+        print(f"[SAVE][ANGLE] done in {time.monotonic() - start_time:.3f}s")
         
 
         
