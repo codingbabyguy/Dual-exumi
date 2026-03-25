@@ -80,7 +80,7 @@ class AngleSensor(mp.Process):
            VR_HOST, LOCAL_HOST, ANGLE_POSE_CMD_PORT, ANGLE_IK_RESULT_PORT, vis_sp=None
         )
           # 允许在没有姿态包时也能继续采集角度
-          self.quest.wrist_listener_s.settimeout(0.01)
+        self.quest.wrist_listener_s.settimeout(0.01)
 
         print("*******************************")
         print("*       Quest process         *")
