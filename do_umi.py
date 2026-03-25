@@ -7,6 +7,7 @@ Usage:
 Controls:
     w: start a new batch (creates batch_N subfolder)
     e: end current batch (flush and stop saving)
+    d: delete current batch data and restart current batch id
     q: quit
 
 Behavior:
@@ -19,6 +20,7 @@ import os
 import sys
 import time
 import errno
+import shutil
 import threading
 import select
 import tty
@@ -153,6 +155,40 @@ class SharedState:
                 "batch_active": self.batch_active,
                 "vr_dir": self.vr_dir,
                 "tactile_dir": self.tactile_dir,
+                "batch_id": self.batch_id,
+                "batch_dir": self.current_batch_dir,
+            }
+
+    def status_text(self):
+        with self.lock:
+            mode = "采集中" if self.batch_active else "待机"
+            return f"当前batch: {self.batch_id} | 状态: {mode}"
+
+    def delete_and_restart_current_batch(self):
+        with self.lock:
+            if not self.batch_active or self.current_batch_dir is None:
+                return None
+
+            batch_dir = self.current_batch_dir
+            if os.path.exists(batch_dir):
+                shutil.rmtree(batch_dir)
+
+            vr_dir = os.path.join(batch_dir, "pose")
+            self.tactile_folder_name = f"tactile_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            tactile_dir = os.path.join(batch_dir, self.tactile_folder_name)
+
+            os.makedirs(vr_dir, exist_ok=True)
+            os.makedirs(tactile_dir, exist_ok=True)
+            os.makedirs(os.path.join(batch_dir, "latency_calibration"), exist_ok=True)
+            os.makedirs(os.path.join(batch_dir, "raw_videos"), exist_ok=True)
+
+            self.vr_dir = vr_dir
+            self.tactile_dir = tactile_dir
+            return {
+                "batch_dir": batch_dir,
+                "vr_dir": vr_dir,
+                "tactile_dir": tactile_dir,
+                "batch_id": self.batch_id,
             }
 
 
@@ -246,12 +282,26 @@ def tactile_worker(state: SharedState, stop_event: threading.Event, save_interva
                     if duration < save_interval:
                         time.sleep(save_interval - duration)
                 else:
-                    # 批次未激活时，重置保存目录
+                    # 批次结束时做一次强制落盘，避免短 batch 没有 left/right 数据
                     if current_save_dir is not None:
+                        print(f"[Tactile] 批次结束，执行最后一次触觉落盘: {current_save_dir}")
+                        env.save_dir = current_save_dir
+                        try:
+                            env.get_and_save_data()
+                        except Exception as e:
+                            print(f"[Tactile][WARN] batch结束落盘失败: {e}")
                         print("[Tactile] 批次未激活，停止保存触觉数据")
                         current_save_dir = None
                     time.sleep(0.2)
         finally:
+            # 线程退出前再尝试一次落盘，降低中断造成的数据丢失概率
+            if current_save_dir is not None:
+                print(f"[Tactile] 线程退出前最后落盘: {current_save_dir}")
+                env.save_dir = current_save_dir
+                try:
+                    env.get_and_save_data()
+                except Exception as e:
+                    print(f"[Tactile][WARN] 退出前落盘失败: {e}")
             env.stop(wait=True)
             print("[Tactile] Tactile worker thread exited.")
 
@@ -305,7 +355,7 @@ def main():
         print("  ├── tactile_YYYYMMDD_HHMMSS/  # 触觉数据文件夹")
         print("  ├── latency_calibration/ # 标定视频(预留)")
         print("  └── raw_videos/         # 原始视频(预留)")
-        print("[MAIN] 按 'w' 开始batch, 'e' 结束当前batch, 'q' 退出")
+        print("[MAIN] 按 'w' 开始batch, 'e' 结束当前batch, 'd' 删除并重采当前batch, 'q' 退出")
 
         state = SharedState(root_dir)
         stop_event = threading.Event()
@@ -321,6 +371,7 @@ def main():
         vr_thread.start()
         tactile_thread.start()
         print("[MAIN] VR和Tactile采集线程已启动。")
+        print(f"[MAIN][STATUS] {state.status_text()}")
 
         with RawMode():
             try:
@@ -332,6 +383,7 @@ def main():
                         batch_dir = state.start_batch()
                         if batch_dir:
                             print(f"[MAIN] 开始 batch: {batch_dir}")
+                        print(f"[MAIN][STATUS] {state.status_text()}")
                     elif key == "e":
                         finished_dir = state.end_batch()
                         if finished_dir:
@@ -339,14 +391,44 @@ def main():
                                 print("[MAIN] Flushing VR chunk for batch end...")
                                 chunker.save_and_reset()
                             print(f"[MAIN] 结束 batch: {finished_dir}")
+                        print(f"[MAIN][STATUS] {state.status_text()}")
+                    elif key == "d":
+                        print("[MAIN][CONFIRM] 确认删除当前 batch 数据并重采？按 y 确认，按 n 取消。")
+                        confirm = None
+                        while confirm is None:
+                            c = read_key(timeout=0.1)
+                            if c is None:
+                                continue
+                            lc = c.lower()
+                            if lc in ("y", "n"):
+                                confirm = lc
+
+                        if confirm == "y":
+                            reset_info = state.delete_and_restart_current_batch()
+                            if reset_info:
+                                chunker.discard_and_reset(reason="Current batch deleted by user.")
+                                print(
+                                    f"[MAIN] 已删除并重建 batch_{reset_info['batch_id']}:\n"
+                                    f"  - VR数据: {reset_info['vr_dir']}\n"
+                                    f"  - 触觉数据: {reset_info['tactile_dir']}"
+                                )
+                            else:
+                                print("[MAIN] 当前没有进行中的 batch，无法删除重采。")
+                        else:
+                            print("[MAIN] 已取消删除当前 batch。")
+                        print(f"[MAIN][STATUS] {state.status_text()}")
                     elif key == "q":
                         print("[MAIN] 退出中...")
                         break
             finally:
                 stop_event.set()
                 print("[MAIN] 等待采集线程退出...")
-                vr_thread.join()
-                tactile_thread.join()
+                vr_thread.join(timeout=5.0)
+                tactile_thread.join(timeout=5.0)
+                if vr_thread.is_alive():
+                    print("[MAIN][WARN] VR线程未在超时内退出，将随主进程结束。")
+                if tactile_thread.is_alive():
+                    print("[MAIN][WARN] Tactile线程未在超时内退出，将随主进程结束。")
         print("[MAIN] 采集完成。")
     finally:
         if physics_client is not None and pb.isConnected():

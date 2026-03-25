@@ -14,6 +14,18 @@ os.chdir(ROOT_DIR)
 import pathlib
 import click
 import subprocess
+import shlex
+import time
+
+
+def run_step(step_name, cmd):
+    print(f"[START] {step_name}")
+    print(f"[CMD] {' '.join(shlex.quote(item) for item in cmd)}")
+    start_time = time.time()
+    result = subprocess.run(cmd)
+    elapsed = time.time() - start_time
+    print(f"[END] {step_name} | returncode={result.returncode} | elapsed={elapsed:.2f}s")
+    return result
 
 # %%
 @click.command()
@@ -31,9 +43,13 @@ def main(session_dir, calibration_dir, gripper_threshold, calibration_axis, init
     else:
         calibration_dir = pathlib.Path(calibration_dir)
     assert calibration_dir.is_dir()
+    print(f"[INFO] script_dir={script_dir}")
+    print(f"[INFO] calibration_dir={calibration_dir}")
+    print(f"[INFO] skip_calib={skip_calib}, only_calib={only_calib}, calibration_axis={calibration_axis}, init_offset={init_offset}, gripper_threshold={gripper_threshold}")
 
     for session in session_dir:
         session = pathlib.Path(__file__).parent.joinpath(session).absolute()
+        print(f"\n[SESSION] {session}")
 
         print("############## AR_00_process_videos #############")
         script_path = script_dir.joinpath("AR_00_process_videos.py")
@@ -42,10 +58,11 @@ def main(session_dir, calibration_dir, gripper_threshold, calibration_axis, init
             'python', str(script_path),
             str(session)
         ]
-        result = subprocess.run(cmd)
+        result = run_step("AR_00_process_videos", cmd)
         assert result.returncode == 0
         
         demo_dir = session.joinpath('demos')
+        print(f"[INFO] demo_dir={demo_dir}")
 
 
         if not skip_calib:
@@ -59,10 +76,13 @@ def main(session_dir, calibration_dir, gripper_threshold, calibration_axis, init
                 '--init_offset', str(init_offset),
                 str(session)
             ]
-            result = subprocess.run(cmd)
+            result = run_step("AR_01_arcap_latency_align", cmd)
             assert result.returncode == 0
+        else:
+            print("[SKIP] AR_01_arcap_latency_align (skip_calib=True)")
 
         if only_calib:
+            print("[SKIP] Remaining steps (only_calib=True)")
             continue
         
 
@@ -75,7 +95,7 @@ def main(session_dir, calibration_dir, gripper_threshold, calibration_axis, init
             '-calib', str(session.joinpath('latency_calibration/latency_of_arcap.json')),
             '-tactile_calib', 'ARCap/tactile_calib/shape_config.yaml',
         ]
-        result = subprocess.run(cmd)
+        result = run_step("AR_03_align_trajectory", cmd)
         assert result.returncode == 0
 
         print("############# AR_06_generate_dataset_plan ###########")
@@ -89,8 +109,9 @@ def main(session_dir, calibration_dir, gripper_threshold, calibration_axis, init
         ]
         if gripper_threshold:
             cmd.extend(["--gripper_threshold", str(gripper_threshold)])
-        result = subprocess.run(cmd)
+        result = run_step("AR_06_generate_dataset_plan", cmd)
         assert result.returncode == 0
+        print(f"[SESSION DONE] {session}")
 
 ## %%
 if __name__ == "__main__":

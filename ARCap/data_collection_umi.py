@@ -16,6 +16,7 @@ exUMI 数据采集服务器端脚本
 
 import socket
 import time
+import threading
 from argparse import ArgumentParser
 import pybullet as pb
 import numpy as np
@@ -65,6 +66,7 @@ class DataChunker:
         self.timestamps = []  # 存储对应的时间戳
 
         self.last_save_dir = None  # 上一次使用的保存目录
+        self._lock = threading.Lock()
 
     def put(self, x, save_dir):
         """
@@ -82,33 +84,34 @@ class DataChunker:
            - 如果之前有保存数据，保存当前块
            - 清空缓冲区
         """
-        if save_dir is not None:
+        with self._lock:
+            if save_dir is not None:
 
-            if self.last_save_dir is None or self.last_save_dir == save_dir:
-                self.last_save_dir = save_dir
-                self.records.append(x)
-                self.timestamps.append(time.time())
-            
-                if len(self.records) > self.chunksize:
-                    self.save_and_reset()
+                if self.last_save_dir is None or self.last_save_dir == save_dir:
+                    self.last_save_dir = save_dir
+                    self.records.append(x)
+                    self.timestamps.append(time.time())
 
-            else:
-                self.save_and_reset()
+                    if len(self.records) > self.chunksize:
+                        self._save_and_reset_locked()
 
-                self.records.append(x)
-                self.timestamps.append(time.time())
-                self.last_save_dir = save_dir
+                else:
+                    self._save_and_reset_locked()
 
-        else:
-            
-            if self.last_save_dir is not None:
-                self.save_and_reset()
+                    self.records.append(x)
+                    self.timestamps.append(time.time())
+                    self.last_save_dir = save_dir
 
             else:
-                self.records = []
-                self.timestamps = []
 
-            self.last_save_dir = None
+                if self.last_save_dir is not None:
+                    self._save_and_reset_locked()
+
+                else:
+                    self.records = []
+                    self.timestamps = []
+
+                self.last_save_dir = None
             
 
     def save_and_reset(self):
@@ -124,7 +127,15 @@ class DataChunker:
         - 使用 np.savez 保存为 NumPy 的压缩格式
         - 保存后清空缓冲区，准备接收新数据
         """
-        assert self.last_save_dir is not None
+        with self._lock:
+            self._save_and_reset_locked()
+
+    def _save_and_reset_locked(self):
+        if self.last_save_dir is None or len(self.records) == 0 or len(self.timestamps) == 0:
+            self.records = []
+            self.timestamps = []
+            self.last_save_dir = None
+            return
 
         path = f"{self.last_save_dir}/chunk_{self.timestamps[0]}_{self.timestamps[-1]}.npz"
         np.savez(
@@ -132,12 +143,22 @@ class DataChunker:
             pose=self.records,
             time=self.timestamps,
         )
-        
+
         self.records = []
         self.timestamps = []
         self.last_save_dir = None
 
         print(f"Saved chunk to {path}")
+
+    def discard_and_reset(self, reason=""):
+        """Drop buffered records without saving, used when deleting current batch data."""
+        with self._lock:
+            dropped = len(self.records)
+            self.records = []
+            self.timestamps = []
+            self.last_save_dir = None
+        if dropped > 0:
+            print(f"[VR] Dropped {dropped} buffered pose samples. {reason}".strip())
 
             
 

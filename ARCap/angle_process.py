@@ -3,6 +3,7 @@ import sys
 sys.path.append('/home/xuyue/tactile_umi_grav/ARCap')
 import smbus
 import time
+import socket
 import numpy as np
 #from ip_config import *
 import pybullet as pb
@@ -78,6 +79,8 @@ class AngleSensor(mp.Process):
         self.quest = QuestRightArmLeapModule(
            VR_HOST, LOCAL_HOST, ANGLE_POSE_CMD_PORT, ANGLE_IK_RESULT_PORT, vis_sp=None
         )
+          # 允许在没有姿态包时也能继续采集角度
+          self.quest.wrist_listener_s.settimeout(0.01)
 
         print("*******************************")
         print("*       Quest process         *")
@@ -135,58 +138,51 @@ class AngleSensor(mp.Process):
         threadpool_limits(self.num_threads)
         try:
             fps = self.capture_fps
-            put_idx = None
             put_start_time = time.time()
 
             iter_idx = 0
             t_start = time.time()
             
-            if iter_idx == 0:
-                self.ready_event.set()
+            self.ready_event.set()
             while not self.stop_event.is_set():
                 iter_start_time = time.monotonic()
 
-                wrist, head_pose = self.quest.receive()
-                if wrist:
-                    angle = read_rotary_angle()
-                    
-                
-                    t_cal = time.time()
-                    step_idx = int((t_cal - put_start_time) * self.put_fps)
-                    data = {
-                        'angle': np.array([angle], dtype=np.uint16),
-                        'data':np.concatenate(wrist),
-                        'timestamp': t_cal,
-                        'step_idx': step_idx
-                    }
+                wrist = None
+                try:
+                    wrist, _ = self.quest.receive()
+                except socket.timeout:
+                    wrist = None
+                except Exception:
+                    wrist = None
 
-                    put_data = data
+                # AS5600 持续采集；姿态缺失时写入 NaN 占位，保证 angle 文件持续输出
+                angle = read_rotary_angle()
+                pose_data = np.concatenate(wrist) if wrist else np.full((7,), np.nan, dtype=float)
 
-                
-                    
-                
-                
-                    self.ring_buffer.put(put_data)
+                t_cal = time.time()
+                step_idx = int((t_cal - put_start_time) * self.put_fps)
+                data = {
+                    'angle': np.array([angle], dtype=np.uint16),
+                    'data': pose_data,
+                    'timestamp': t_cal,
+                    'step_idx': step_idx
+                }
 
-                    # signal ready
-                    
+                self.ring_buffer.put(data)
 
-                    # perf
-                    t_end = time.time()
-                    duration = t_end - t_start
-                    frequency = np.round(1 / duration, 1)
-                    t_start = t_end
-                    if self.verbose:
-                        print(f'[AngleSensor] FPS {frequency}')
+                # perf
+                t_end = time.time()
+                duration = t_end - t_start
+                frequency = np.round(1 / duration, 1)
+                t_start = t_end
+                if self.verbose:
+                    print(f'[AngleSensor] FPS {frequency}')
 
-                    iter_idx += 1
+                iter_idx += 1
 
-                    iter_duration = time.monotonic() - iter_start_time
-                    if iter_duration < 1. / self.capture_fps:
-                        time.sleep(1. / self.capture_fps - iter_duration)
-                if iter_idx == 0:
-                   
-                    self.ready_event.set()
+                iter_duration = time.monotonic() - iter_start_time
+                if iter_duration < 1. / self.capture_fps:
+                    time.sleep(1. / self.capture_fps - iter_duration)
 
         finally:
             pass

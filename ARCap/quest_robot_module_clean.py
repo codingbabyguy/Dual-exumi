@@ -209,6 +209,48 @@ class QuestRightArmLeapModule(QuestRobotModule):
             if pose is not None:
                 return pose
 
+    def _drain_ee_packets(self, max_packets=200):
+        """Drain queued UDP packets so the next sample reflects current controller pose."""
+        old_timeout = self.wrist_listener_s.gettimeout()
+        drained = 0
+        try:
+            self.wrist_listener_s.settimeout(0.0)
+            while drained < max_packets:
+                try:
+                    data, _ = self.wrist_listener_s.recvfrom(1024)
+                except BlockingIOError:
+                    break
+                except socket.error:
+                    break
+                if self._parse_ee_pose(data.decode()) is not None:
+                    drained += 1
+        finally:
+            self.wrist_listener_s.settimeout(old_timeout)
+        return drained
+
+    def _sample_fresh_ee_pose(self, window_sec=0.15):
+        """Sample latest EE pose from a short window after draining stale packets."""
+        self._drain_ee_packets()
+        old_timeout = self.wrist_listener_s.gettimeout()
+        deadline = time.monotonic() + window_sec
+        latest_pose = None
+        try:
+            while time.monotonic() < deadline:
+                remain = max(0.001, deadline - time.monotonic())
+                self.wrist_listener_s.settimeout(remain)
+                try:
+                    data, _ = self.wrist_listener_s.recvfrom(1024)
+                except socket.timeout:
+                    continue
+                pose = self._parse_ee_pose(data.decode())
+                if pose is not None:
+                    latest_pose = pose
+            if latest_pose is None:
+                return self._recv_ee_pose_blocking()
+            return latest_pose
+        finally:
+            self.wrist_listener_s.settimeout(old_timeout)
+
     @staticmethod
     def _normalize(v):
         n = np.linalg.norm(v)
@@ -240,13 +282,13 @@ class QuestRightArmLeapModule(QuestRobotModule):
         """Interactive calibration using origin, +X, +Y, +Z guidance based on EE packets."""
         print("[VR][CALIB] Axis calibration started.")
         print("[VR][CALIB] Keep controller steady, waiting for initial EE pose...")
-        origin_pose = self._recv_ee_pose_blocking()
+        origin_pose = self._sample_fresh_ee_pose(window_sec=0.2)
         p0 = origin_pose[:3]
         print(f"[VR][CALIB] Origin captured: ({p0[0]:.4f}, {p0[1]:.4f}, {p0[2]:.4f})")
 
         while True:
             input("[VR][CALIB] Move toward +X, then press Enter to sample... ")
-            px = self._recv_ee_pose_blocking()[:3]
+            px = self._sample_fresh_ee_pose(window_sec=0.2)[:3]
             dx = np.linalg.norm(px - p0)
             if dx >= min_move:
                 print(f"[VR][CALIB] +X sample accepted, move={dx:.4f} m")
@@ -255,7 +297,7 @@ class QuestRightArmLeapModule(QuestRobotModule):
 
         while True:
             input("[VR][CALIB] Move toward +Y, then press Enter to sample... ")
-            py = self._recv_ee_pose_blocking()[:3]
+            py = self._sample_fresh_ee_pose(window_sec=0.2)[:3]
             dy = np.linalg.norm(py - p0)
             if dy >= min_move:
                 print(f"[VR][CALIB] +Y sample accepted, move={dy:.4f} m")
@@ -264,7 +306,7 @@ class QuestRightArmLeapModule(QuestRobotModule):
 
         while True:
             input("[VR][CALIB] Move toward +Z (for sign check), then press Enter to sample... ")
-            pz = self._recv_ee_pose_blocking()[:3]
+            pz = self._sample_fresh_ee_pose(window_sec=0.2)[:3]
             dz = np.linalg.norm(pz - p0)
             if dz >= min_move:
                 print(f"[VR][CALIB] +Z verification sample accepted, move={dz:.4f} m")
