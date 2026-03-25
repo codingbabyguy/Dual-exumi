@@ -33,7 +33,7 @@ def run_step(step_name, cmd):
 @click.option('-c', '--calibration_dir', type=str, default=None)
 @click.option('-gth', '--gripper_threshold', type=float, default=None, help="")
 @click.option('--calibration_axis', type=str, default="x", help='')
-@click.option('--init_offset', type=float, default=0)
+@click.option('--init_offset', type=float, default=-27)
 @click.option('--only_calib', is_flag=True, default=False, help="only run calibration")
 @click.option('--skip_calib', is_flag=True, default=False, help="skip the calibration")
 def main(session_dir, calibration_dir, gripper_threshold, calibration_axis, init_offset, only_calib, skip_calib):
