@@ -141,6 +141,9 @@ def load_proprio_interp(session_dir, latency, extend_boundary=None, rotation_min
     time_list = []
     width_list = []
     pose_list = []
+    angle_clip_total = 0
+    angle_clip_low = 0
+    angle_clip_high = 0
 
     all_proprio_files = list(pathlib.Path(session_dir).glob('tactile_*/angle_*.json'))
     if len(all_proprio_files) == 0:
@@ -156,15 +159,29 @@ def load_proprio_interp(session_dir, latency, extend_boundary=None, rotation_min
             assert len(_angles) == len(_times) == len(_pose), f"Data length mismatch: {_angles} vs {_times} vs {_pose}"
 
             time_list += _times
-            width_list += [
-                as5600_to_width(as5600_preprocess(x))
-                for x in _angles]
+            for x in _angles:
+                x_proc = as5600_preprocess(x)
+                if x_proc < as5600_to_width.left_max:
+                    angle_clip_total += 1
+                    angle_clip_low += 1
+                    x_proc = as5600_to_width.left_max
+                elif x_proc > as5600_to_width.right_min:
+                    angle_clip_total += 1
+                    angle_clip_high += 1
+                    x_proc = as5600_to_width.right_min
+                width_list.append(float(as5600_to_width(x_proc)))
             pose_list += _pose
 
     time_list = np.array(time_list)
 
     width_interp = WrappedInterp1d(time_list - latency, width_list, extend_boundary=extend_boundary)
     pose_interp  = WrappedInterp1d(time_list - latency, pose_list, extend_boundary=extend_boundary)
+    if angle_clip_total > 0:
+        print(
+            "WARNING: clipped out-of-range AS5600 readings "
+            f"total={angle_clip_total}, low={angle_clip_low}, high={angle_clip_high}, "
+            f"valid_range=[{as5600_to_width.left_max}, {as5600_to_width.right_min}]"
+        )
     print("proprio time range", width_interp.left_max, width_interp.right_min)
 
     return pose_interp, width_interp
