@@ -48,10 +48,10 @@ class WrappedInterp1d:
 
     def __call__(self, x):
         if self.left_min < x < self.left_max:
-            print(f"WARNING: extrapolating left: {self.left_min} < {x} < {self.left_max}")
+            #print(f"WARNING: extrapolating left: {self.left_min} < {x} < {self.left_max}")
             return self.left_val
         elif self.right_min < x < self.right_max:
-            print(f"WARNING: extrapolating right: {self.right_min} < {x} < {self.right_max}")
+            #print(f"WARNING: extrapolating right: {self.right_min} < {x} < {self.right_max}")
             return self.right_val
         else:
             return self.traj_interp(x)

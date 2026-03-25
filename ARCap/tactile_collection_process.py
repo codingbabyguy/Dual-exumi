@@ -2,6 +2,7 @@ import time
 import cv2
 import os
 import json
+from datetime import datetime
 from multiprocessing.managers import SharedMemoryManager
 from .camera_process import UsbCamera, CsiCamera, TactileCamera
 from .angle_process import AngleSensor
@@ -13,6 +14,12 @@ from .ip_config import TACTILE_CAMERA
 
 def _fmt_ts(ts):
     return f"{ts:.6f}" if ts is not None else "None"
+
+
+def timestamp_to_readable(ts_unix: float) -> str:
+    """将Unix时间戳转换为可读的标准时间格式"""
+    dt = datetime.fromtimestamp(ts_unix)
+    return dt.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]  # 精确到毫秒
 
 
 def _safe_len(x):
@@ -58,6 +65,7 @@ class TactileCollectionEnv:
 
         self.camera_dict = camera_dict
         self.last_camera_data = {k: None for k in camera_dict.keys()}
+        self.last_angle_data = None
         self.save_dir = save_dir
         self.global_step = 0
         
@@ -221,13 +229,18 @@ class TactileCollectionEnv:
 
         frame_count = _safe_len(camera_data["color"])
         if len(timestamps) > 0:
-            print(
-                f"[SAVE][CAMERA] {camera_name}: saved {frame_count} frames -> {video_path}; "
-                f"timestamps -> {json_path}; range=[{_fmt_ts(timestamps[0])}, {_fmt_ts(timestamps[-1])}]"
-            )
+            readable_first = timestamp_to_readable(timestamps[0])
+            readable_last = timestamp_to_readable(timestamps[-1])
+            print(f"\n[触觉相机保存] {camera_name.upper()}:")
+            print(f"  视频文件: {video_path}")
+            print(f"  帧数: {frame_count} 帧")
+            print(f"  起始时间: {readable_first}")
+            print(f"  结束时间: {readable_last}")
+            print(f"  Unix时间: {_fmt_ts(timestamps[0])} ~ {_fmt_ts(timestamps[-1])}")
+            print(f"  时间戳文件: {json_path}")
         else:
-            print(f"[SAVE][CAMERA][WARN] {camera_name}: saved empty timestamp list -> {json_path}")
-        print(f"[SAVE][CAMERA] {camera_name}: done in {time.monotonic() - start_time:.3f}s")
+            print(f"\n[触觉相机保存][警告] {camera_name}: 空时间戳列表 -> {json_path}")
+        print(f"  保存耗时: {time.monotonic() - start_time:.3f}s\n")
 
     def _save_realsense_video_and_json(self, camera_name, camera_data):
         start_time = time.monotonic()
@@ -268,14 +281,18 @@ class TactileCollectionEnv:
         n = len(timestamps)
         if n > 0:
             angle_vals = [int(a[0]) if hasattr(a, '__len__') else int(a) for a in angles]
-            print(
-                f"\033[92m[SAVE][ANGLE] saved {n} samples -> {angle_path}; "
-                f"time=[{_fmt_ts(timestamps[0])}, {_fmt_ts(timestamps[-1])}], "
-                f"angle[min={min(angle_vals)}, max={max(angle_vals)}]\033[0m"
-            )
+            readable_first = timestamp_to_readable(timestamps[0])
+            readable_last = timestamp_to_readable(timestamps[-1])
+            print(f"\n[旋转传感器保存] ANGLE:")
+            print(f"  数据文件: {angle_path}")
+            print(f"  采样数量: {n} 个")
+            print(f"  起始时间: {readable_first}")
+            print(f"  结束时间: {readable_last}")
+            print(f"  Unix时间: {_fmt_ts(timestamps[0])} ~ {_fmt_ts(timestamps[-1])}")
+            print(f"  角度范围: min={min(angle_vals)}, max={max(angle_vals)}")
         else:
-            print(f"\033[93m[SAVE][ANGLE][WARN] wrote empty angle file -> {angle_path}\033[0m")
-        print(f"[SAVE][ANGLE] done in {time.monotonic() - start_time:.3f}s")
+            print(f"\n[旋转传感器保存][警告] 空角度数据文件 -> {angle_path}")
+        print(f"  保存耗时: {time.monotonic() - start_time:.3f}s\n")
         
 
         
