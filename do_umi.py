@@ -37,6 +37,20 @@ def timestamp_to_readable(ts_unix: float) -> str:
     dt = datetime.fromtimestamp(ts_unix)
     return dt.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]  # 精确到毫秒
 
+
+def format_saved_range(label: str, info: dict):
+    """Format one-line saved time range for per-second report."""
+    if not info:
+        return f"{label}时间: 暂无已保存数据"
+    first_ts = info.get("first_ts")
+    last_ts = info.get("last_ts")
+    if first_ts is None or last_ts is None:
+        return f"{label}时间: 暂无已保存数据"
+    return (
+        f"{label}时间: {timestamp_to_readable(first_ts)} ~ {timestamp_to_readable(last_ts)} "
+        f"(Unix {first_ts:.6f} ~ {last_ts:.6f})"
+    )
+
 from ARCap.data_collection_umi import DataChunker
 from ARCap.quest_robot_module_clean import QuestRightArmLeapModule
 from ARCap.ip_config import (
@@ -210,11 +224,7 @@ def vr_worker(
     print("[VR] Reusing calibrated Quest socket for data collection.")
     last_tick = time.time()
     worldframe_marker = {"saved": False, "last_pending_log": 0.0}
-    
-    # 时间戳统计
-    vr_timestamps = []
-    ts_last_print = time.time()
-    
+
     try:
         while not stop_event.is_set():
             try:
@@ -225,33 +235,7 @@ def vr_worker(
 
             snap = state.snapshot()
             save_dir = snap["vr_dir"] if snap["batch_active"] else None
-            
-            current_ts = time.time()
-            if wrist:
-                vr_timestamps.append(current_ts)
-            
-            # 每秒输出一次时间戳统计
-            if current_ts - ts_last_print >= 1.0:
-                if vr_timestamps:
-                    avg_ts = sum(vr_timestamps) / len(vr_timestamps)
-                    ts_range = [vr_timestamps[0], vr_timestamps[-1]]
-                    readable_first = timestamp_to_readable(ts_range[0])
-                    readable_last = timestamp_to_readable(ts_range[1])
-                    print(f"\n{'='*80}")
-                    print(f"[VR位姿数据] 当前时间段统计:")
-                    print(f"  采样数量: {len(vr_timestamps)} 帧")
-                    print(f"  起始时间: {readable_first}")
-                    print(f"  结束时间: {readable_last}")
-                    print(f"  Unix时间: {ts_range[0]:.7f} ~ {ts_range[1]:.7f}")
-                    print(f"  时间跨度: {ts_range[1]-ts_range[0]:.4f} 秒")
-                    print(f"{'='*80}\n")
-                else:
-                    print(f"\n{'='*80}")
-                    print(f"[VR位姿数据] 本秒无数据接收")
-                    print(f"{'='*80}\n")
-                vr_timestamps = []
-                ts_last_print = current_ts
-            
+
             if save_dir:
                 if getattr(quest, "latest_world_frame", None) is None:
                     now = time.time()
@@ -264,10 +248,6 @@ def vr_worker(
                 pos, quat = wrist
                 data = np.concatenate((pos, quat))
                 chunker.put(data, save_dir)
-                if save_dir:
-                    print(f"[VR] Data saved to batch: {save_dir} | Timestamp: {current_ts:.7f}")
-                else:
-                    print("[VR] Receiving data, batch not active. Data not saved.")
 
             now = time.time()
             target_dt = 1.0 / float(freq_hz)
@@ -283,7 +263,13 @@ def vr_worker(
         print("[VR] VR worker thread exited.")
 
 
-def tactile_worker(state: SharedState, stop_event: threading.Event, save_interval: float = 5.0, fps: int = 30):
+def tactile_worker(
+    state: SharedState,
+    stop_event: threading.Event,
+    chunker: DataChunker,
+    save_interval: float = 5.0,
+    fps: int = 30,
+):
     print("[Tactile] Tactile worker thread starting...")
     camera_dev_path_dict = {side: (UsbCamera, device) for side, device in TACTILE_CAMERA.items()}
     
@@ -291,10 +277,36 @@ def tactile_worker(state: SharedState, stop_event: threading.Event, save_interva
     current_save_dir = None
     next_collect_at = 0.0
     
-    # 时间戳统计
-    tactile_timestamps = {side: [] for side in camera_dev_path_dict.keys()}
-    angle_timestamps = []
-    ts_last_print = time.time()
+    last_report_ts = time.time()
+    last_saved_angle = None
+    last_saved_tactile = None
+
+    def update_saved_from_summary(summary: dict):
+        nonlocal last_saved_angle, last_saved_tactile
+        if not isinstance(summary, dict):
+            return
+
+        angle_info = summary.get("angle")
+        if isinstance(angle_info, dict) and angle_info.get("saved", False):
+            last_saved_angle = {
+                "first_ts": angle_info.get("first_ts"),
+                "last_ts": angle_info.get("last_ts"),
+                "count": angle_info.get("count", 0),
+            }
+
+        camera_saved = [
+            item for item in summary.get("cameras", {}).values()
+            if isinstance(item, dict) and item.get("saved", False)
+        ]
+        if camera_saved:
+            first_ts = min(item["first_ts"] for item in camera_saved)
+            last_ts = max(item["last_ts"] for item in camera_saved)
+            total_count = sum(item.get("count", 0) for item in camera_saved)
+            last_saved_tactile = {
+                "first_ts": first_ts,
+                "last_ts": last_ts,
+                "count": total_count,
+            }
     
     with SharedMemoryManager() as shm_manager:
         env = TactileCollectionEnv(
@@ -312,47 +324,13 @@ def tactile_worker(state: SharedState, stop_event: threading.Event, save_interva
             while not stop_event.is_set():
                 snap = state.snapshot()
                 current_time = time.time()
-                
-                # 每秒输出一次时间戳统计
-                if current_time - ts_last_print >= 1.0:
-                    print(f"\n{'#'*80}")
-                    print(f"### 触觉和角度传感器 - 当前时间统计")
-                    print(f"{'#'*80}")
-                    
-                    # 触觉摄像头时间戳
-                    for side in tactile_timestamps.keys():
-                        if tactile_timestamps[side]:
-                            ts_list = tactile_timestamps[side]
-                            readable_first = timestamp_to_readable(ts_list[0])
-                            readable_last = timestamp_to_readable(ts_list[-1])
-                            print(f"\n[触觉相机-{side.upper()}] 当前时间:")
-                            print(f"  帧数: {len(ts_list)} 帧")
-                            print(f"  起始时间: {readable_first}")
-                            print(f"  结束时间: {readable_last}")
-                            print(f"  Unix时间: {ts_list[0]:.7f} ~ {ts_list[-1]:.7f}")
-                            print(f"  时间跨度: {ts_list[-1]-ts_list[0]:.4f} 秒")
-                        else:
-                            print(f"\n[触觉相机-{side.upper()}] 本秒无数据")
-                    
-                    # Angle时间戳
-                    if angle_timestamps:
-                        readable_first = timestamp_to_readable(angle_timestamps[0])
-                        readable_last = timestamp_to_readable(angle_timestamps[-1])
-                        print(f"\n[旋转传感器-ANGLE] 当前时间:")
-                        print(f"  采样数量: {len(angle_timestamps)} 个")
-                        print(f"  起始时间: {readable_first}")
-                        print(f"  结束时间: {readable_last}")
-                        print(f"  Unix时间: {angle_timestamps[0]:.7f} ~ {angle_timestamps[-1]:.7f}")
-                        print(f"  时间跨度: {angle_timestamps[-1]-angle_timestamps[0]:.4f} 秒")
-                    else:
-                        print(f"\n[旋转传感器-ANGLE] 本秒无数据")
-                    
-                    print(f"{'#'*80}\n")
-                    
-                    # 重置统计
-                    tactile_timestamps = {side: [] for side in camera_dev_path_dict.keys()}
-                    angle_timestamps = []
-                    ts_last_print = current_time
+
+                if current_time - last_report_ts >= 1.0:
+                    vr_saved = chunker.get_last_saved_info()
+                    print("\n" + format_saved_range("VR位姿", vr_saved))
+                    print(format_saved_range("angle", last_saved_angle))
+                    print(format_saved_range("tactile相机", last_saved_tactile) + "\n")
+                    last_report_ts = current_time
                 
                 if snap["batch_active"] and snap["tactile_dir"]:
                     # 批次激活且目录变化时更新保存目录
@@ -364,28 +342,9 @@ def tactile_worker(state: SharedState, stop_event: threading.Event, save_interva
 
                     now = time.monotonic()
                     if now >= next_collect_at:
-                        print(f"[Tactile] 保存触觉数据到: {env.save_dir}")
-                        start_ts = time.monotonic()
-                        
-                        # 采集前记录时间戳
-                        pre_collect_time = time.time()
-                        env.get_and_save_data()
-                        post_collect_time = time.time()
-                        
-                        # 从env对象中获取最新的时间戳数据
-                        if hasattr(env, 'last_camera_data'):
-                            for side in camera_dev_path_dict.keys():
-                                if side in env.last_camera_data:
-                                    camera_data = env.last_camera_data[side]
-                                    if camera_data and 'timestamp' in camera_data:
-                                        tactile_timestamps[side].extend(camera_data['timestamp'].tolist())
-                        
-                        if hasattr(env, 'last_angle_data') and env.last_angle_data:
-                            if 'timestamp' in env.last_angle_data:
-                                angle_timestamps.extend(env.last_angle_data['timestamp'].tolist())
-                        
-                        duration = time.monotonic() - start_ts
-                        print(f"[Tactile] 批次持续时间: {duration:.2f}s (间隔: {save_interval}s)")
+                        summary = env.get_and_save_data()
+                        update_saved_from_summary(summary)
+
                         next_collect_at = time.monotonic() + save_interval
                     else:
                         # 使用短sleep，避免错过短batch切换
@@ -396,7 +355,8 @@ def tactile_worker(state: SharedState, stop_event: threading.Event, save_interva
                         print(f"[Tactile] 批次结束，执行最后一次触觉落盘: {current_save_dir}")
                         env.save_dir = current_save_dir
                         try:
-                            env.get_and_save_data()
+                            summary = env.get_and_save_data()
+                            update_saved_from_summary(summary)
                         except Exception as e:
                             print(f"[Tactile][WARN] batch结束落盘失败: {e}")
                         print("[Tactile] 批次未激活，停止保存触觉数据")
@@ -409,7 +369,8 @@ def tactile_worker(state: SharedState, stop_event: threading.Event, save_interva
                 print(f"[Tactile] 线程退出前最后落盘: {current_save_dir}")
                 env.save_dir = current_save_dir
                 try:
-                    env.get_and_save_data()
+                    summary = env.get_and_save_data()
+                    update_saved_from_summary(summary)
                 except Exception as e:
                     print(f"[Tactile][WARN] 退出前落盘失败: {e}")
 
@@ -497,7 +458,7 @@ def main():
             kwargs={"freq_hz": 30},
             daemon=True,
         )
-        tactile_thread = threading.Thread(target=tactile_worker, args=(state, stop_event), daemon=True)
+        tactile_thread = threading.Thread(target=tactile_worker, args=(state, stop_event, chunker), daemon=True)
         vr_thread.start()
         tactile_thread.start()
         print("[MAIN] VR和Tactile采集线程已启动。")

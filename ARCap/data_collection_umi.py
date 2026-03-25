@@ -66,6 +66,7 @@ class DataChunker:
         self.timestamps = []  # 存储对应的时间戳
 
         self.last_save_dir = None  # 上一次使用的保存目录
+        self.last_saved_info = None  # 最近一次成功落盘的摘要信息
         self._lock = threading.Lock()
 
     def put(self, x, save_dir):
@@ -138,17 +139,35 @@ class DataChunker:
             return
 
         path = f"{self.last_save_dir}/chunk_{self.timestamps[0]}_{self.timestamps[-1]}.npz"
+        first_ts = float(self.timestamps[0])
+        last_ts = float(self.timestamps[-1])
+        sample_count = len(self.timestamps)
         np.savez(
             path,
             pose=self.records,
             time=self.timestamps,
         )
 
+        self.last_saved_info = {
+            "path": path,
+            "first_ts": first_ts,
+            "last_ts": last_ts,
+            "count": sample_count,
+            "saved_at": time.time(),
+        }
+
         self.records = []
         self.timestamps = []
         self.last_save_dir = None
 
         print(f"Saved chunk to {path}")
+
+    def get_last_saved_info(self):
+        """Return the last successfully saved VR chunk metadata."""
+        with self._lock:
+            if self.last_saved_info is None:
+                return None
+            return dict(self.last_saved_info)
 
     def discard_and_reset(self, reason=""):
         """Drop buffered records without saving, used when deleting current batch data."""

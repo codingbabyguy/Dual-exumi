@@ -5,7 +5,6 @@ import smbus
 import time
 import socket
 import numpy as np
-from datetime import datetime
 #from ip_config import *
 import pybullet as pb
 from threadpoolctl import threadpool_limits
@@ -30,13 +29,6 @@ AS5600_BUS = smbus.SMBus(1)
 def read_rotary_angle():  # Read angle (0-360 represented as 0-4096)
     read_bytes = AS5600_BUS.read_i2c_block_data(DEVICE_AS5600, 0x0C, 2)
     return (read_bytes[0] << 8) | read_bytes[1]
-
-
-def timestamp_to_readable(ts_unix: float) -> str:
-    """将Unix时间戳转换为可读的标准时间格式"""
-    dt = datetime.fromtimestamp(ts_unix)
-    return dt.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]  # 精确到毫秒
-
 class AngleSensor(mp.Process):
     def __init__(
             self,
@@ -150,10 +142,6 @@ class AngleSensor(mp.Process):
             iter_idx = 0
             t_start = time.time()
             
-            # 时间戳统计
-            angle_timestamps = []
-            ts_last_print = time.time()
-            
             self.ready_event.set()
             while not self.stop_event.is_set():
                 iter_start_time = time.monotonic()
@@ -171,8 +159,7 @@ class AngleSensor(mp.Process):
                 pose_data = np.concatenate(wrist) if wrist else np.full((7,), np.nan, dtype=float)
 
                 t_cal = time.time()
-                angle_timestamps.append(t_cal)  # 记录时间戳
-                
+
                 step_idx = int((t_cal - put_start_time) * self.put_fps)
                 data = {
                     'angle': np.array([angle], dtype=np.uint16),
@@ -182,26 +169,6 @@ class AngleSensor(mp.Process):
                 }
 
                 self.ring_buffer.put(data)
-
-                # 每秒输出一次时间戳统计
-                if t_cal - ts_last_print >= 1.0:
-                    if angle_timestamps:
-                        readable_first = timestamp_to_readable(angle_timestamps[0])
-                        readable_last = timestamp_to_readable(angle_timestamps[-1])
-                        print(f"\n{'-'*70}")
-                        print(f"[旋转传感器-ANGLE] 当前时间:")
-                        print(f"  采样数量: {len(angle_timestamps)} 个")
-                        print(f"  起始时间: {readable_first}")
-                        print(f"  结束时间: {readable_last}")
-                        print(f"  Unix时间: {angle_timestamps[0]:.7f} ~ {angle_timestamps[-1]:.7f}")
-                        print(f"  时间跨度: {angle_timestamps[-1]-angle_timestamps[0]:.4f} 秒")
-                        print(f"{'-'*70}\n")
-                    else:
-                        print(f"\n{'-'*70}")
-                        print(f"[旋转传感器-ANGLE] 本秒无数据")
-                        print(f"{'-'*70}\n")
-                    angle_timestamps = []
-                    ts_last_print = t_cal
 
                 # perf
                 t_end = time.time()
