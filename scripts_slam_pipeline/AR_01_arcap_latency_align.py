@@ -68,27 +68,38 @@ def detect_turning_points(data):
         turning_points: 转向点列表，每个元素为 (timestamp, direction_change, position)
         - direction_change: 方向变化量，+2表示从左转右，-2表示从右转左
     """
+    # 过滤插值越界导致的无效点
+    valid_data = [
+        (t, p) for t, p in data
+        if p is not None and np.isfinite(p)
+    ]
+    if len(valid_data) < 3:
+        return []
+
     # 提取位置和时间戳数据
-    position = [d[1] for d in data]
-    timestamp = [d[0] for d in data]
+    timestamp = [d[0] for d in valid_data]
+    position = np.array([d[1] for d in valid_data], dtype=float)
 
     # 去除轨迹开始和结束的稳定区域
     # 稳定区域定义为运动幅度小于总幅度10%的区域
     max_diff = np.max(position) - np.min(position)
     stable_diff = 0.1 * max_diff
     
+    if max_diff <= 1e-12:
+        return []
+
     # 从左侧开始找到第一个非稳定区域
     left = 0
     window_max, window_min = position[0], position[0]
-    while window_max - window_min < stable_diff:
+    while left < len(position) - 1 and window_max - window_min < stable_diff:
         left += 1
         window_max = max(window_max, position[left])
         window_min = min(window_min, position[left])
 
     # 从右侧开始找到最后一个非稳定区域
-    right = -1
-    window_max, window_min = position[-1], position[-1]
-    while window_max - window_min < stable_diff:
+    right = len(position) - 1
+    window_max, window_min = position[right], position[right]
+    while right > 0 and window_max - window_min < stable_diff:
         right -= 1
         window_max = max(window_max, position[right])
         window_min = min(window_min, position[right])
@@ -96,6 +107,9 @@ def detect_turning_points(data):
     # 截取有效运动区域
     position = position[left:right+1]
     timestamp = timestamp[left:right+1]
+
+    if len(position) < 3:
+        return []
 
     # 使用高斯滤波去除轨迹噪声
     # 参数sigma=1表示滤波强度，可根据数据调整
@@ -259,14 +273,24 @@ def main(session_dir, calibration_dir, calibration_axis, init_offset):
         timepoints = sorted(timepoints)
         for t in timepoints:
             arcap_trajectory.append( ( t, get_axis_value(traj_interp, t) ) )
-        turn_point_arcap = detect_turning_points(arcap_trajectory)
+
+        arcap_trajectory_valid = [
+            (t, v) for t, v in arcap_trajectory
+            if v is not None and np.isfinite(v)
+        ]
+        if len(arcap_trajectory_valid) < 3:
+            print(f"Offset {arcap_time_offset:.2f}: 有效ARCap轨迹点不足，跳过")
+            turn_point_arcap = None
+            continue
+
+        turn_point_arcap = detect_turning_points(arcap_trajectory_valid)
         
         # pickle.dump({
         #     "aruco": aruco_trajectory,
         #     "arcap": arcap_trajectory,
         # }, open(str(latency_calib_dir.joinpath(f'latency_data_{arcap_time_offset}.pkl')), 'wb'))
         
-        plot_trajectories(aruco_trajectory, arcap_trajectory, 
+        plot_trajectories(aruco_trajectory, arcap_trajectory_valid, 
                         [], [],
                         #turn_point_aruco, turn_point_arcap, 
                         latency_calib_dir.joinpath(f'latency_trajectory_offset{arcap_time_offset}.pdf'))
@@ -314,13 +338,28 @@ def main(session_dir, calibration_dir, calibration_axis, init_offset):
 
     aruco_trajectory = sorted(aruco_trajectory, key=lambda x: x[0])
     timepoints = [t for t, v in aruco_trajectory]
-    aruco_pos = np.array([v for t, v in aruco_trajectory])
-    aruco_pos = (aruco_pos - np.mean(aruco_pos)) / np.std(aruco_pos)  # normalized
+    aruco_pos_raw = np.array([v for t, v in aruco_trajectory], dtype=float)
 
 
     def mse_error(x):
-        arcap_pos = np.array([get_axis_value(traj_interp, t+x[0]) for t in timepoints])
-        arcap_pos = (arcap_pos - np.mean(arcap_pos)) / np.std(arcap_pos)
+        arcap_samples = [get_axis_value(traj_interp, t + x[0]) for t in timepoints]
+        valid_mask = np.array(
+            [v is not None and np.isfinite(v) for v in arcap_samples],
+            dtype=bool
+        )
+        if np.sum(valid_mask) < 3:
+            return 1e6
+
+        arcap_pos = np.array([v for v, m in zip(arcap_samples, valid_mask) if m], dtype=float)
+        aruco_pos = aruco_pos_raw[valid_mask]
+
+        arcap_std = np.std(arcap_pos)
+        aruco_std = np.std(aruco_pos)
+        if arcap_std <= 1e-12 or aruco_std <= 1e-12:
+            return 1e6
+
+        arcap_pos = (arcap_pos - np.mean(arcap_pos)) / arcap_std
+        aruco_pos = (aruco_pos - np.mean(aruco_pos)) / aruco_std
         return np.mean((aruco_pos - arcap_pos)**2)
 
     left_offset_bound  = -1.0 + init_offset
@@ -352,8 +391,16 @@ def main(session_dir, calibration_dir, calibration_axis, init_offset):
 
     lat = latency_of_arcap_result["mean_2"]
     calibrated_arcap_trajectory = []
-    for t, v in arcap_trajectory:
-        calibrated_arcap_trajectory.append((t-lat, v))
+    arcap_trajectory_final = [
+        (t + lat, get_axis_value(traj_interp, t + lat))
+        for t in timepoints
+    ]
+    arcap_trajectory_final = [
+        (t, v) for t, v in arcap_trajectory_final
+        if v is not None and np.isfinite(v)
+    ]
+    for t, v in arcap_trajectory_final:
+        calibrated_arcap_trajectory.append((t - lat, v))
     plot_trajectories(aruco_trajectory, calibrated_arcap_trajectory, 
                     [], [], 
                     latency_calib_dir.joinpath(f'latency_trajectory_final_algo_2.pdf'))
