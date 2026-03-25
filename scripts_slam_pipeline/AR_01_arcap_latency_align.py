@@ -195,6 +195,8 @@ def main(session_dir, calibration_dir, calibration_axis, init_offset):
     # load_proprio_interp函数加载VR姿态数据并创建时间插值器
     # latency=0.0表示不应用时间延迟，extend_boundary=10表示扩展边界10秒
     traj_interp, _ = load_proprio_interp(session_dir, latency=0.0, extend_boundary=10)
+    proprio_start_ts = traj_interp.left_max
+    proprio_end_ts = traj_interp.right_min
     
     # 步骤2: 检测ArUco标记
     print("检测ArUco标记")
@@ -240,10 +242,28 @@ def main(session_dir, calibration_dir, calibration_axis, init_offset):
                 x = frame['tag_dict'][ARUCO_ID]['tvec'][0]    # x-axis
                 aruco_trajectory.append((frame['time']+video_start_time, x))
 
+    aruco_timepoints = sorted([t for t, _ in aruco_trajectory])
+    aruco_start_ts = aruco_timepoints[0]
+    aruco_end_ts = aruco_timepoints[-1]
+
+    query_start_ts = aruco_start_ts + init_offset
+    query_end_ts = aruco_end_ts + init_offset
+
+    overlap_start = max(proprio_start_ts, query_start_ts)
+    overlap_end = min(proprio_end_ts, query_end_ts)
+    overlap_sec = max(0.0, overlap_end - overlap_start)
+
+    print("[ALIGN DEBUG] proprio_valid_ts:", proprio_start_ts, "->", proprio_end_ts)
+    print("[ALIGN DEBUG] aruco_detected_ts:", aruco_start_ts, "->", aruco_end_ts)
+    print("[ALIGN DEBUG] query_ts_with_init_offset:", query_start_ts, "->", query_end_ts, f"(init_offset={init_offset})")
+    print("[ALIGN DEBUG] overlap_ts:", overlap_start, "->", overlap_end, f"(overlap_sec={overlap_sec:.3f})")
+    print("[ALIGN DEBUG] aruco_sample_head:", aruco_timepoints[:5])
+    print("[ALIGN DEBUG] aruco_sample_tail:", aruco_timepoints[-5:])
+
     
     # get arcap trajectory for plotting
     extend_range = 15
-    timepoints = sorted([t for t, _ in aruco_trajectory])
+    timepoints = aruco_timepoints
     time_extend_before = np.linspace(timepoints[0]-extend_range, timepoints[0], 100).tolist()
     time_extend_after = np.linspace(timepoints[-1], timepoints[-1]+extend_range, 100).tolist()
     timepoints = time_extend_before + timepoints + time_extend_after
