@@ -204,6 +204,7 @@ def main(session_dir, calibration_dir, calibration_axis, init_offset):
             '--aruco_yaml', str(aruco_config),      # ArUco配置文件
             '--num_workers', '1'                    # 单线程处理
         ]
+        cmd = [str(item) for item in cmd]
         print(f"执行ArUco检测命令: {' '.join(cmd)}")
         result = subprocess.run(cmd)
         assert result.returncode == 0, "ArUco检测失败"

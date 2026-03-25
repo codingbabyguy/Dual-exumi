@@ -251,6 +251,7 @@ def tactile_worker(state: SharedState, stop_event: threading.Event, save_interva
     
     # 初始保存目录设为None，将在批次激活时设置
     current_save_dir = None
+    next_collect_at = 0.0
     
     with SharedMemoryManager() as shm_manager:
         env = TactileCollectionEnv(
@@ -268,19 +269,24 @@ def tactile_worker(state: SharedState, stop_event: threading.Event, save_interva
             while not stop_event.is_set():
                 snap = state.snapshot()
                 if snap["batch_active"] and snap["tactile_dir"]:
-                    # 只有在批次激活且目录变化时才更新保存目录
+                    # 批次激活且目录变化时更新保存目录
                     if current_save_dir != snap["tactile_dir"]:
                         env.save_dir = snap["tactile_dir"]
                         current_save_dir = snap["tactile_dir"]
+                        next_collect_at = 0.0
                         print(f"[Tactile] 切换到新的触觉数据目录: {env.save_dir}")
-                    
-                    print(f"[Tactile] 保存触觉数据到: {env.save_dir}")
-                    start_ts = time.monotonic()
-                    env.get_and_save_data()
-                    duration = time.monotonic() - start_ts
-                    print(f"[Tactile] 批次持续时间: {duration:.2f}s (间隔: {save_interval}s)")
-                    if duration < save_interval:
-                        time.sleep(save_interval - duration)
+
+                    now = time.monotonic()
+                    if now >= next_collect_at:
+                        print(f"[Tactile] 保存触觉数据到: {env.save_dir}")
+                        start_ts = time.monotonic()
+                        env.get_and_save_data()
+                        duration = time.monotonic() - start_ts
+                        print(f"[Tactile] 批次持续时间: {duration:.2f}s (间隔: {save_interval}s)")
+                        next_collect_at = time.monotonic() + save_interval
+                    else:
+                        # 使用短sleep，避免错过短batch切换
+                        time.sleep(min(0.1, max(0.0, next_collect_at - now)))
                 else:
                     # 批次结束时做一次强制落盘，避免短 batch 没有 left/right 数据
                     if current_save_dir is not None:
@@ -292,7 +298,8 @@ def tactile_worker(state: SharedState, stop_event: threading.Event, save_interva
                             print(f"[Tactile][WARN] batch结束落盘失败: {e}")
                         print("[Tactile] 批次未激活，停止保存触觉数据")
                         current_save_dir = None
-                    time.sleep(0.2)
+                    next_collect_at = 0.0
+                    time.sleep(0.1)
         finally:
             # 线程退出前再尝试一次落盘，降低中断造成的数据丢失概率
             if current_save_dir is not None:
@@ -302,7 +309,27 @@ def tactile_worker(state: SharedState, stop_event: threading.Event, save_interva
                     env.get_and_save_data()
                 except Exception as e:
                     print(f"[Tactile][WARN] 退出前落盘失败: {e}")
-            env.stop(wait=True)
+
+            # 限时停止，避免单个采集子进程卡住导致 q 无法完全退出
+            env.stop(wait=False)
+            deadline = time.time() + 3.0
+            while time.time() < deadline:
+                cam_alive = [name for name, cam in env.camera_dict.items() if cam.is_alive()]
+                angle_alive = env.angle_sensor.is_alive()
+                if not cam_alive and not angle_alive:
+                    break
+                time.sleep(0.1)
+
+            for name, cam in env.camera_dict.items():
+                if cam.is_alive():
+                    print(f"[Tactile][WARN] 相机进程未退出，强制结束: {name}")
+                    cam.terminate()
+                    cam.join(timeout=0.5)
+            if env.angle_sensor.is_alive():
+                print("[Tactile][WARN] Angle进程未退出，强制结束")
+                env.angle_sensor.terminate()
+                env.angle_sensor.join(timeout=0.5)
+
             print("[Tactile] Tactile worker thread exited.")
 
 
