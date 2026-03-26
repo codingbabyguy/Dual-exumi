@@ -157,6 +157,7 @@ def main(session_dir, jump_sigma, min_jump_sec):
 
     all_t = []
     all_pose = []
+    all_pose_t = []
     file_stats = []
 
     for fp in proprio_files:
@@ -192,9 +193,49 @@ def main(session_dir, jump_sigma, min_jump_sec):
 
         all_t.append(ts)
         all_pose.append(pose)
+        if pose.ndim == 2 and pose.shape[1] >= 7 and len(ts) == len(pose):
+            valid_mask = np.all(np.isfinite(pose[:, :7]), axis=1)
+            if np.any(valid_mask):
+                all_pose_t.append(np.column_stack([ts[valid_mask], pose[valid_mask, :7]]))
 
     all_t = np.concatenate(all_t) if all_t else np.array([], dtype=float)
-    all_pose = np.concatenate(all_pose, axis=0) if all_pose else np.zeros((0, 0), dtype=float)
+    all_pose_raw = np.concatenate(all_pose, axis=0) if all_pose else np.zeros((0, 0), dtype=float)
+
+    pose_source = "angle_json"
+    if all_pose_t:
+        merged = np.concatenate(all_pose_t, axis=0)
+        order = np.argsort(merged[:, 0])
+        all_pose = merged[order, 1:8]
+    else:
+        pose_chunk_files = sorted(session_dir.glob("pose/chunk_*.npz"))
+        chunk_pose_list = []
+        for chunk_fp in pose_chunk_files:
+            try:
+                with np.load(str(chunk_fp)) as chunk:
+                    if "pose" not in chunk or "time" not in chunk:
+                        continue
+                    pose_chunk = np.asarray(chunk["pose"], dtype=float)
+                    time_chunk = np.asarray(chunk["time"], dtype=float)
+                    if pose_chunk.ndim != 2 or pose_chunk.shape[1] < 7:
+                        continue
+                    if len(pose_chunk) != len(time_chunk):
+                        continue
+                    valid_mask = np.all(np.isfinite(pose_chunk[:, :7]), axis=1)
+                    if np.any(valid_mask):
+                        chunk_pose_list.append(
+                            np.column_stack([time_chunk[valid_mask], pose_chunk[valid_mask, :7]])
+                        )
+            except Exception:
+                continue
+
+        if chunk_pose_list:
+            merged = np.concatenate(chunk_pose_list, axis=0)
+            order = np.argsort(merged[:, 0])
+            all_pose = merged[order, 1:8]
+            pose_source = "pose_chunk_npz"
+        else:
+            all_pose = all_pose_raw
+            pose_source = "none_valid"
 
     if all_t.size < 2:
         raise ValueError("Not enough timestamps to analyze.")
@@ -254,6 +295,7 @@ def main(session_dir, jump_sigma, min_jump_sec):
             "top10_jump_values_sec": all_dt[jump_mask][:10].tolist(),
         },
         "pose_stats": {
+            "pose_source": pose_source,
             "pose_dim": pose_dim,
             "axis": axis_stats,
             "nan_inf_total": int(np.size(all_pose) - np.sum(np.isfinite(all_pose))),
@@ -271,6 +313,7 @@ def main(session_dir, jump_sigma, min_jump_sec):
 
     log("INFO", f"报告已保存: {report_path}")
     log("INFO", f"可视化目录: {out_dir}")
+    log("INFO", f"pose来源: {pose_source}")
     log("INFO", f"timestamps异常: duplicate={dup_total}, non_monotonic={non_mono_total}, large_jump={jump_total}")
     for name in ["x", "y", "z"]:
         st = axis_stats[name]
