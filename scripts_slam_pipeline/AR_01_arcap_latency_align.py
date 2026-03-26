@@ -39,6 +39,7 @@ import pickle
 import time
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation, FFMpegWriter
 from scipy.ndimage import gaussian_filter
 from collections import Counter
 
@@ -344,6 +345,148 @@ def save_zscore_shape_plot(save_path, aruco_time, aruco_raw, arcap_raw, title):
     fig.tight_layout()
     fig.savefig(str(save_path))
     plt.close(fig)
+
+
+def save_algo1_alignment_mp4(
+    save_path,
+    aruco_trajectory,
+    arcap_trajectory_valid,
+    turn_point_aruco,
+    turn_point_arcap,
+    title,
+    fps=30,
+):
+    """算法1可视化动画：按时间推进展示 ArUco/VR 轨迹与转向点。"""
+    aruco_sorted = sorted(aruco_trajectory, key=lambda x: x[0])
+    arcap_sorted = sorted(arcap_trajectory_valid, key=lambda x: x[0])
+
+    if len(aruco_sorted) == 0:
+        log("WARN", f"动画未生成(aruco为空): {save_path}")
+        return
+
+    ta = np.array([t for t, _ in aruco_sorted], dtype=float)
+    va = np.array([v for _, v in aruco_sorted], dtype=float)
+
+    has_arcap = len(arcap_sorted) > 0
+    if has_arcap:
+        tb = np.array([t for t, _ in arcap_sorted], dtype=float)
+        vb = np.array([v for _, v in arcap_sorted], dtype=float)
+    else:
+        tb = np.array([], dtype=float)
+        vb = np.array([], dtype=float)
+
+    t0 = min(ta[0], tb[0] if has_arcap else ta[0])
+    t1 = max(ta[-1], tb[-1] if has_arcap else ta[-1])
+    if t1 - t0 < 1e-9:
+        t1 = t0 + 1e-3
+
+    n_frames = max(120, min(600, len(ta) * 2))
+    frame_ts = np.linspace(t0, t1, n_frames)
+
+    fig, axes = plt.subplots(2, 1, figsize=(10, 6), sharex=True)
+    fig.suptitle(title)
+
+    vals = va.tolist() + (vb.tolist() if has_arcap else [])
+    y_min, y_max = float(np.min(vals)), float(np.max(vals))
+    y_pad = max(0.1 * (y_max - y_min), 1e-3)
+
+    # 上图：轨迹随时间推进
+    axes[0].set_ylabel("position")
+    axes[0].set_ylim(y_min - y_pad, y_max + y_pad)
+    axes[0].grid(True, alpha=0.25)
+
+    line_a, = axes[0].plot([], [], color="#4c72b0", lw=2, label="ArUco")
+    head_a = axes[0].scatter([], [], color="#4c72b0", s=25)
+    line_b, = axes[0].plot([], [], color="#dd8452", lw=2, label="VR(ARCap)")
+    head_b = axes[0].scatter([], [], color="#dd8452", s=25)
+
+    tp_a_pos = [(t, v) for t, d, v in turn_point_aruco if d > 0]
+    tp_a_neg = [(t, v) for t, d, v in turn_point_aruco if d < 0]
+    tp_b_pos = [(t, v) for t, d, v in turn_point_arcap if d > 0]
+    tp_b_neg = [(t, v) for t, d, v in turn_point_arcap if d < 0]
+
+    sc_a_pos = axes[0].scatter([], [], color="red", s=20, label="Aruco turn +")
+    sc_a_neg = axes[0].scatter([], [], color="blue", s=20, label="Aruco turn -")
+    sc_b_pos = axes[0].scatter([], [], color="#ff7f0e", s=20, marker="x", label="VR turn +")
+    sc_b_neg = axes[0].scatter([], [], color="#8c564b", s=20, marker="x", label="VR turn -")
+
+    axes[0].legend(loc="upper right", fontsize=8)
+
+    # 下图：转向点索引对比
+    axes[1].set_ylabel("turn timestamp")
+    axes[1].set_xlabel("turn index")
+    axes[1].grid(True, alpha=0.25)
+    idx_a = np.arange(len(turn_point_aruco))
+    idx_b = np.arange(len(turn_point_arcap))
+    ts_a = np.array([t for t, _, _ in turn_point_aruco], dtype=float) if len(turn_point_aruco) else np.array([])
+    ts_b = np.array([t for t, _, _ in turn_point_arcap], dtype=float) if len(turn_point_arcap) else np.array([])
+
+    l_idx_a, = axes[1].plot([], [], color="#4c72b0", marker="o", lw=1.5, label="Aruco turn time")
+    l_idx_b, = axes[1].plot([], [], color="#dd8452", marker="x", lw=1.5, label="VR turn time")
+    axes[1].legend(loc="upper left", fontsize=8)
+
+    status_text = axes[0].text(0.01, 0.95, "", transform=axes[0].transAxes, fontsize=9, va="top")
+
+    def _set_scatter(sc, points):
+        if len(points) == 0:
+            sc.set_offsets(np.empty((0, 2)))
+        else:
+            sc.set_offsets(np.array(points, dtype=float))
+
+    def update(frame_idx):
+        t_cur = frame_ts[frame_idx]
+
+        ma = ta <= t_cur
+        line_a.set_data(ta[ma], va[ma])
+        if np.any(ma):
+            head_a.set_offsets(np.array([[ta[ma][-1], va[ma][-1]]], dtype=float))
+        else:
+            head_a.set_offsets(np.empty((0, 2)))
+
+        if has_arcap:
+            mb = tb <= t_cur
+            line_b.set_data(tb[mb], vb[mb])
+            if np.any(mb):
+                head_b.set_offsets(np.array([[tb[mb][-1], vb[mb][-1]]], dtype=float))
+            else:
+                head_b.set_offsets(np.empty((0, 2)))
+        else:
+            line_b.set_data([], [])
+            head_b.set_offsets(np.empty((0, 2)))
+
+        _set_scatter(sc_a_pos, [(t, v) for t, v in tp_a_pos if t <= t_cur])
+        _set_scatter(sc_a_neg, [(t, v) for t, v in tp_a_neg if t <= t_cur])
+        _set_scatter(sc_b_pos, [(t, v) for t, v in tp_b_pos if t <= t_cur])
+        _set_scatter(sc_b_neg, [(t, v) for t, v in tp_b_neg if t <= t_cur])
+
+        if len(ts_a):
+            k_a = int(np.sum(ts_a <= t_cur))
+            l_idx_a.set_data(idx_a[:k_a], ts_a[:k_a])
+        else:
+            l_idx_a.set_data([], [])
+
+        if len(ts_b):
+            k_b = int(np.sum(ts_b <= t_cur))
+            l_idx_b.set_data(idx_b[:k_b], ts_b[:k_b])
+        else:
+            l_idx_b.set_data([], [])
+
+        status_text.set_text(
+            f"t={t_cur:.3f} | ArUco points={np.sum(ma)} | VR points={(np.sum(tb <= t_cur) if has_arcap else 0)}"
+        )
+
+        return line_a, line_b, l_idx_a, l_idx_b, status_text
+
+    ani = FuncAnimation(fig, update, frames=n_frames, interval=1000.0 / fps, blit=False)
+
+    try:
+        writer = FFMpegWriter(fps=fps, metadata={"artist": "AR_01_algo1"}, bitrate=1800)
+        ani.save(str(save_path), writer=writer)
+        log("INFO", f"已保存算法1 MP4可视化: {save_path}")
+    except Exception as exc:
+        log("WARN", f"算法1 MP4生成失败({save_path}): {exc}")
+    finally:
+        plt.close(fig)
 
 
 def detect_turning_points(data, name="trajectory"):
@@ -748,6 +891,23 @@ def main(session_dir, calibration_dir, calibration_axis, init_offset):
                 ),
             )
             log("INFO", f"已保存算法1转向点对比图(失败态): {turn_pair_plot_path}")
+
+            # 算法1失败态也导出MP4，便于回放“为何VR轨迹不可用”
+            algo1_mp4_path = latency_calib_dir.joinpath(
+                f'latency_algo1_alignment_offset{arcap_time_offset:.2f}.mp4'
+            )
+            save_algo1_alignment_mp4(
+                algo1_mp4_path,
+                aruco_trajectory,
+                arcap_trajectory_valid,
+                turn_point_aruco,
+                [],
+                title=(
+                    f"Algo1 alignment offset={arcap_time_offset:.2f} | "
+                    f"FAILED valid={len(arcap_trajectory_valid)}"
+                ),
+                fps=30,
+            )
             log("WARN", f"Offset {arcap_time_offset:.2f}: 有效ARCap轨迹点不足，跳过")
             turn_point_arcap = None
             continue
@@ -780,6 +940,20 @@ def main(session_dir, calibration_dir, calibration_axis, init_offset):
             title=f"Turning-Points Compare offset={arcap_time_offset:.2f}",
         )
         log("INFO", f"已保存算法1转向点对比图: {turn_pair_plot_path}")
+
+        # 算法1成功采样态导出MP4，展示双轨迹与转向点随时间演化
+        algo1_mp4_path = latency_calib_dir.joinpath(
+            f'latency_algo1_alignment_offset{arcap_time_offset:.2f}.mp4'
+        )
+        save_algo1_alignment_mp4(
+            algo1_mp4_path,
+            aruco_trajectory,
+            arcap_trajectory_valid,
+            turn_point_aruco,
+            turn_point_arcap,
+            title=f"Algo1 alignment offset={arcap_time_offset:.2f}",
+            fps=30,
+        )
         
         # pickle.dump({
         #     "aruco": aruco_trajectory,
