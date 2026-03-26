@@ -127,6 +127,79 @@ def save_offset_diagnosis_plot(save_path, offsets, valid_counts, mses, corrs, in
     plt.close(fig)
 
 
+def save_vr_sampling_process_plot(
+    save_path,
+    aruco_timepoints,
+    traj_interp,
+    get_axis_value,
+    init_offset,
+    candidate_offsets,
+):
+    aruco_timepoints = np.array(aruco_timepoints, dtype=float)
+    if aruco_timepoints.size == 0:
+        return
+
+    offsets = np.array(candidate_offsets, dtype=float)
+    validity = np.zeros((len(offsets), len(aruco_timepoints)), dtype=int)
+    sampled_values = np.full((len(offsets), len(aruco_timepoints)), np.nan, dtype=float)
+
+    for i, off in enumerate(offsets):
+        for j, t in enumerate(aruco_timepoints):
+            v = get_axis_value(traj_interp, t + off)
+            if v is not None and np.isfinite(v):
+                validity[i, j] = 1
+                sampled_values[i, j] = float(v)
+
+    init_idx = int(np.argmin(np.abs(offsets - init_offset)))
+    q_init = aruco_timepoints + offsets[init_idx]
+    valid_init = validity[init_idx].astype(bool)
+
+    left_min = getattr(traj_interp, "left_min", np.nan)
+    left_max = getattr(traj_interp, "left_max", np.nan)
+    right_min = getattr(traj_interp, "right_min", np.nan)
+    right_max = getattr(traj_interp, "right_max", np.nan)
+
+    fig, axes = plt.subplots(3, 1, figsize=(11, 8), sharex=False)
+
+    # 子图1: 时间范围与插值边界
+    axes[0].hlines(2.0, aruco_timepoints[0], aruco_timepoints[-1], color="#4c72b0", linewidth=8, label="ArUco raw")
+    axes[0].hlines(1.5, q_init[0], q_init[-1], color="#55a868", linewidth=8, label=f"ArUco + init_offset({offsets[init_idx]:.2f})")
+    if np.isfinite(left_min) and np.isfinite(left_max):
+        axes[0].hlines(1.0, left_min, left_max, color="#9ecae1", linewidth=10, label="VR left extension")
+    if np.isfinite(left_max) and np.isfinite(right_min):
+        axes[0].hlines(0.7, left_max, right_min, color="#dd8452", linewidth=10, label="VR strict interp range")
+    if np.isfinite(right_min) and np.isfinite(right_max):
+        axes[0].hlines(0.4, right_min, right_max, color="#fdd0a2", linewidth=10, label="VR right extension")
+    axes[0].set_yticks([0.4, 0.7, 1.0, 1.5, 2.0])
+    axes[0].set_yticklabels(["VR right ext", "VR interp", "VR left ext", "Aruco+offset", "Aruco"])
+    axes[0].set_title("VR Parsing/Sampling Time Windows")
+    axes[0].grid(True, alpha=0.25)
+    axes[0].legend(loc="best")
+
+    # 子图2: 不同offset下每个采样点的有效性
+    extent = [0, len(aruco_timepoints), offsets[0] - 0.5, offsets[-1] + 0.5]
+    axes[1].imshow(validity, aspect="auto", cmap="RdYlGn", interpolation="nearest", extent=extent, origin="lower")
+    axes[1].set_ylabel("offset (s)")
+    axes[1].set_title("Sample Validity Matrix (green=valid, red=invalid)")
+    axes[1].grid(False)
+
+    # 子图3: init_offset下采样值与有效性
+    rel_t = aruco_timepoints - aruco_timepoints[0]
+    axes[2].plot(rel_t, sampled_values[init_idx], color="#dd8452", label="VR sampled value")
+    invalid_rel_t = rel_t[~valid_init]
+    if invalid_rel_t.size > 0:
+        axes[2].scatter(invalid_rel_t, np.zeros_like(invalid_rel_t), s=12, color="red", alpha=0.7, label="invalid samples")
+    axes[2].set_xlabel("relative time from first ArUco sample (s)")
+    axes[2].set_ylabel("sampled VR value")
+    axes[2].set_title("VR Sampled Values at init_offset")
+    axes[2].grid(True, alpha=0.25)
+    axes[2].legend(loc="best")
+
+    fig.tight_layout()
+    fig.savefig(str(save_path))
+    plt.close(fig)
+
+
 def eval_offset_diagnostics(timepoints, aruco_vals, traj_interp, get_axis_value, offset):
     arcap_samples = [get_axis_value(traj_interp, t + offset) for t in timepoints]
     valid_mask = np.array([v is not None and np.isfinite(v) for v in arcap_samples], dtype=bool)
@@ -527,6 +600,23 @@ def main(session_dir, calibration_dir, calibration_axis, init_offset):
     log("INFO", f"[ALIGN DEBUG] overlap_ts: {overlap_start:.6f} -> {overlap_end:.6f} (overlap_sec={overlap_sec:.3f})")
     log("INFO", f"[ALIGN DEBUG] aruco_sample_head: {aruco_timepoints[:5]}")
     log("INFO", f"[ALIGN DEBUG] aruco_sample_tail: {aruco_timepoints[-5:]}")
+
+    # 诊断图1.5: VR解析与采样过程可视化
+    vr_sampling_plot_path = latency_calib_dir.joinpath('latency_diag_vr_sampling_process.pdf')
+    vr_diag_offsets = [init_offset - 2.0, init_offset - 1.0, init_offset, init_offset + 1.0, init_offset + 2.0]
+    save_vr_sampling_process_plot(
+        vr_sampling_plot_path,
+        aruco_timepoints,
+        traj_interp,
+        get_axis_value,
+        init_offset,
+        vr_diag_offsets,
+    )
+    log("INFO", f"已保存VR解析与采样过程诊断图: {vr_sampling_plot_path}")
+    for off in vr_diag_offsets:
+        vals = [get_axis_value(traj_interp, t + off) for t in aruco_timepoints]
+        valid_count = int(np.sum([v is not None and np.isfinite(v) for v in vals]))
+        log("INFO", f"[VR SAMPLE] offset={off:+.2f}, valid_count={valid_count}/{len(aruco_timepoints)}")
 
     # 诊断图1: 时间范围重叠
     overlap_plot_path = latency_calib_dir.joinpath('latency_diag_time_overlap.pdf')
