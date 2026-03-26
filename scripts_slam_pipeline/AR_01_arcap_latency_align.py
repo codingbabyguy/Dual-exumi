@@ -36,6 +36,7 @@ import click
 import subprocess
 import json
 import pickle
+import time
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.ndimage import gaussian_filter
@@ -51,7 +52,31 @@ from scripts_slam_pipeline.utils.misc import (
 from scripts_slam_pipeline.utils.data_loading import load_proprio_interp
 
 
-def detect_turning_points(data):
+def log(level, message):
+    print(f"[ARCAP_ALIGN][{level}] {message}")
+
+
+def log_section(title):
+    print(f"\n[ARCAP_ALIGN][STEP] {'=' * 12} {title} {'=' * 12}")
+
+
+def summarize_trajectory(name, trajectory):
+    if not trajectory:
+        log("WARN", f"{name} 轨迹为空")
+        return
+    ts = np.array([t for t, _ in trajectory], dtype=float)
+    vals = np.array([v for _, v in trajectory], dtype=float)
+    log(
+        "INFO",
+        (
+            f"{name}: 点数={len(trajectory)}, 时间范围={ts.min():.6f}->{ts.max():.6f}, "
+            f"时长={ts.max()-ts.min():.3f}s, 数值范围={vals.min():.6f}->{vals.max():.6f}, "
+            f"均值={vals.mean():.6f}, 标准差={vals.std():.6f}"
+        )
+    )
+
+
+def detect_turning_points(data, name="trajectory"):
     """
     检测运动轨迹中的转向点（方向变化点）
     
@@ -74,6 +99,7 @@ def detect_turning_points(data):
         if p is not None and np.isfinite(p)
     ]
     if len(valid_data) < 3:
+        log("WARN", f"{name}: 有效点不足3个，无法检测转向点 (valid={len(valid_data)})")
         return []
 
     # 提取位置和时间戳数据
@@ -86,6 +112,7 @@ def detect_turning_points(data):
     stable_diff = 0.1 * max_diff
     
     if max_diff <= 1e-12:
+        log("WARN", f"{name}: 轨迹变化幅度过小(max_diff={max_diff:.6e})，无法检测转向点")
         return []
 
     # 从左侧开始找到第一个非稳定区域
@@ -109,6 +136,7 @@ def detect_turning_points(data):
     timestamp = timestamp[left:right+1]
 
     if len(position) < 3:
+        log("WARN", f"{name}: 去除稳定区后点数不足3个，无法检测转向点")
         return []
 
     # 使用高斯滤波去除轨迹噪声
@@ -127,6 +155,8 @@ def detect_turning_points(data):
             # 计算方向变化量：+2表示从左转右，-2表示从右转左
             direction_change = np.sign(dt2) - np.sign(dt1)
             turning_points.append((timestamp[i], direction_change, position[i]))
+
+            log("INFO", f"{name}: 检测到转向点 {len(turning_points)} 个")
     
     return turning_points
 
@@ -157,7 +187,11 @@ def main(session_dir, calibration_dir, calibration_axis, init_offset):
     """
     
     # 坐标轴索引映射：将字符串坐标轴转换为数值索引
-    calibration_axis_index = {'x': 0, 'y': 1, 'z': 2}[calibration_axis]
+    log_section("参数与路径初始化")
+    axis_map = {'x': 0, 'y': 1, 'z': 2}
+    if calibration_axis not in axis_map:
+        raise ValueError(f"无效 calibration_axis={calibration_axis}，仅支持 x/y/z")
+    calibration_axis_index = axis_map[calibration_axis]
     
     def get_axis_value(interp, value):
         """
@@ -180,34 +214,51 @@ def main(session_dir, calibration_dir, calibration_axis, init_offset):
     calibration_dir = pathlib.Path(calibration_dir)
     session_dir = pathlib.Path(__file__).parent.joinpath(session_dir).absolute()
     latency_calib_dir = session_dir.joinpath('latency_calibration')
+    log("INFO", f"session_dir={session_dir}")
+    log("INFO", f"calibration_dir={calibration_dir}")
+    log("INFO", f"latency_calibration_dir={latency_calib_dir}")
+    log("INFO", f"calibration_axis={calibration_axis} (index={calibration_axis_index}), init_offset={init_offset}")
 
     # 检查目录存在性
-    assert latency_calib_dir.is_dir(), f"标定目录不存在: {latency_calib_dir}"
+    if not latency_calib_dir.is_dir():
+        raise FileNotFoundError(f"标定目录不存在: {latency_calib_dir}")
 
     # 查找标定视频文件
-    calibration_mp4 = get_single_path(
-        list(latency_calib_dir.glob('**/*.MP4')) + list(latency_calib_dir.glob('**/*.mp4'))
-    )
+    mp4_candidates = list(latency_calib_dir.glob('**/*.MP4')) + list(latency_calib_dir.glob('**/*.mp4'))
+    log("INFO", f"发现标定视频候选数量: {len(mp4_candidates)}")
+    try:
+        calibration_mp4 = get_single_path(mp4_candidates)
+    except Exception as exc:
+        log("ERROR", f"无法确定唯一标定视频，请检查latency_calibration目录: {exc}")
+        raise
+    log("INFO", f"使用标定视频: {calibration_mp4}")
 
 
     # 步骤1: 加载VR姿态轨迹插值器
-    print("加载VR姿态轨迹插值器")
+    log_section("加载VR姿态轨迹插值器")
     # load_proprio_interp函数加载VR姿态数据并创建时间插值器
     # latency=0.0表示不应用时间延迟，extend_boundary=10表示扩展边界10秒
     traj_interp, _ = load_proprio_interp(session_dir, latency=0.0, extend_boundary=10)
     proprio_start_ts = traj_interp.left_max
     proprio_end_ts = traj_interp.right_min
+    log("INFO", f"VR轨迹有效时间范围: {proprio_start_ts:.6f} -> {proprio_end_ts:.6f} (时长={proprio_end_ts-proprio_start_ts:.3f}s)")
     
     # 步骤2: 检测ArUco标记
-    print("检测ArUco标记")
+    log_section("检测ArUco标记")
     script_path = pathlib.Path(__file__).parent.parent.joinpath('scripts', 'detect_aruco_newversion.py')
-    assert script_path.is_file(), f"ArUco检测脚本不存在: {script_path}"
+    if not script_path.is_file():
+        raise FileNotFoundError(f"ArUco检测脚本不存在: {script_path}")
     
     # 检查标定文件存在性
     camera_intrinsics = calibration_dir.joinpath('gopro_intrinsics_2_7k.json')
     aruco_config = calibration_dir.joinpath('aruco_config.yaml')
-    assert camera_intrinsics.is_file(), f"相机内参文件不存在: {camera_intrinsics}"
-    assert aruco_config.is_file(), f"ArUco配置文件不存在: {aruco_config}"
+    if not camera_intrinsics.is_file():
+        raise FileNotFoundError(f"相机内参文件不存在: {camera_intrinsics}")
+    if not aruco_config.is_file():
+        raise FileNotFoundError(f"ArUco配置文件不存在: {aruco_config}")
+    log("INFO", f"检测脚本: {script_path}")
+    log("INFO", f"相机内参: {camera_intrinsics}")
+    log("INFO", f"ArUco配置: {aruco_config}")
     
     # 运行ArUco检测（如果结果文件不存在）
     aruco_out_dir = latency_calib_dir.joinpath('tag_detection.pkl')
@@ -221,26 +272,46 @@ def main(session_dir, calibration_dir, calibration_axis, init_offset):
             '--num_workers', '1'                    # 单线程处理
         ]
         cmd = [str(item) for item in cmd]
-        print(f"执行ArUco检测命令: {' '.join(cmd)}")
+        log("INFO", f"执行ArUco检测命令: {' '.join(cmd)}")
+        t0 = time.time()
         result = subprocess.run(cmd)
-        assert result.returncode == 0, "ArUco检测失败"
+        elapsed = time.time() - t0
+        log("INFO", f"ArUco检测结束: returncode={result.returncode}, 耗时={elapsed:.2f}s")
+        if result.returncode != 0:
+            raise RuntimeError("ArUco检测失败，请检查上方detect_aruco_newversion.py输出日志")
     else:
-        print(f"tag_detection.pkl已存在，跳过ArUco检测: {calibration_mp4}")
+        log("INFO", f"tag_detection.pkl已存在，跳过ArUco检测: {aruco_out_dir}")
 
 
-    print("align visual and trajectory")
+    log_section("视觉轨迹与VR轨迹对齐")
 
     # get aruco trajectory
     video_start_time = mp4_get_start_datetime(str(calibration_mp4)).timestamp()
 
     aruco_pickle_path = latency_calib_dir.joinpath('tag_detection.pkl')
+    if not aruco_pickle_path.is_file():
+        raise FileNotFoundError(f"Aruco检测结果不存在: {aruco_pickle_path}")
+
     with open(str(aruco_pickle_path), "rb") as fp:
         aruco_pkl = pickle.load(fp)
+        if not isinstance(aruco_pkl, (list, tuple)):
+            raise ValueError(f"Aruco检测结果格式异常，期望list/tuple，实际={type(aruco_pkl)}")
+
         aruco_trajectory = []
+        frame_total = 0
+        frame_has_tag = 0
         for frame in aruco_pkl:
+            frame_total += 1
             if ARUCO_ID in frame['tag_dict']:
+                frame_has_tag += 1
                 x = frame['tag_dict'][ARUCO_ID]['tvec'][0]    # x-axis
                 aruco_trajectory.append((frame['time']+video_start_time, x))
+
+    log("INFO", f"Aruco结果帧数: total={frame_total}, 含目标tag={frame_has_tag}, 轨迹点数={len(aruco_trajectory)}")
+    if len(aruco_trajectory) < 3:
+        raise ValueError(f"Aruco轨迹点不足(<3)，无法进行时间对齐。当前点数={len(aruco_trajectory)}")
+
+    summarize_trajectory("aruco_trajectory", aruco_trajectory)
 
     aruco_timepoints = sorted([t for t, _ in aruco_trajectory])
     aruco_start_ts = aruco_timepoints[0]
@@ -253,12 +324,16 @@ def main(session_dir, calibration_dir, calibration_axis, init_offset):
     overlap_end = min(proprio_end_ts, query_end_ts)
     overlap_sec = max(0.0, overlap_end - overlap_start)
 
-    print("[ALIGN DEBUG] proprio_valid_ts:", proprio_start_ts, "->", proprio_end_ts)
-    print("[ALIGN DEBUG] aruco_detected_ts:", aruco_start_ts, "->", aruco_end_ts)
-    print("[ALIGN DEBUG] query_ts_with_init_offset:", query_start_ts, "->", query_end_ts, f"(init_offset={init_offset})")
-    print("[ALIGN DEBUG] overlap_ts:", overlap_start, "->", overlap_end, f"(overlap_sec={overlap_sec:.3f})")
-    print("[ALIGN DEBUG] aruco_sample_head:", aruco_timepoints[:5])
-    print("[ALIGN DEBUG] aruco_sample_tail:", aruco_timepoints[-5:])
+    log("INFO", f"[ALIGN DEBUG] proprio_valid_ts: {proprio_start_ts:.6f} -> {proprio_end_ts:.6f}")
+    log("INFO", f"[ALIGN DEBUG] aruco_detected_ts: {aruco_start_ts:.6f} -> {aruco_end_ts:.6f}")
+    log("INFO", f"[ALIGN DEBUG] query_ts_with_init_offset: {query_start_ts:.6f} -> {query_end_ts:.6f} (init_offset={init_offset})")
+    log("INFO", f"[ALIGN DEBUG] overlap_ts: {overlap_start:.6f} -> {overlap_end:.6f} (overlap_sec={overlap_sec:.3f})")
+    log("INFO", f"[ALIGN DEBUG] aruco_sample_head: {aruco_timepoints[:5]}")
+    log("INFO", f"[ALIGN DEBUG] aruco_sample_tail: {aruco_timepoints[-5:]}")
+    if overlap_sec <= 0:
+        raise ValueError(
+            "Aruco与VR时间区间无重叠，请检查init_offset、相机时间戳或姿态数据有效区间"
+        )
 
     
     # get arcap trajectory for plotting
@@ -272,20 +347,26 @@ def main(session_dir, calibration_dir, calibration_axis, init_offset):
         (t, get_axis_value(traj_interp, t+init_offset)) 
         for t in timepoints
     ]
+    valid_for_plot = sum(v is not None and np.isfinite(v) for _, v in arcap_trajectory_for_plotting)
+    log("INFO", f"长时域绘图轨迹采样点={len(arcap_trajectory_for_plotting)}, 有效点={valid_for_plot}")
     plot_long_horizon_trajectory(
         aruco_trajectory, arcap_trajectory_for_plotting,
         title=f"Offset {init_offset:.2f} (move arcap {'left' if init_offset > 0 else 'right'})",
         save_dir=latency_calib_dir.joinpath(f'latency_trajectory_offset{init_offset}_long.pdf')
     )
+    log("INFO", f"已保存长时域可视化: {latency_calib_dir.joinpath(f'latency_trajectory_offset{init_offset}_long.pdf')}")
     
 
 
     ###### algorithm 1: align by turning points
-    turn_point_aruco = detect_turning_points(aruco_trajectory)
+    log_section("算法1: 转向点检测")
+    turn_point_aruco = detect_turning_points(aruco_trajectory, name="aruco_trajectory")
     turn_point_arcap = None
+    log("INFO", f"算法1初始: aruco转向点数量={len(turn_point_aruco)}")
 
     for arcap_time_offset in [0.0, 1.0, -1.0, 2.0, -2.0]:
         arcap_time_offset += init_offset
+        log("INFO", f"算法1尝试offset={arcap_time_offset:.3f}")
 
         # get arcap trajectory
         arcap_trajectory = []
@@ -299,11 +380,13 @@ def main(session_dir, calibration_dir, calibration_axis, init_offset):
             if v is not None and np.isfinite(v)
         ]
         if len(arcap_trajectory_valid) < 3:
-            print(f"Offset {arcap_time_offset:.2f}: 有效ARCap轨迹点不足，跳过")
+            log("WARN", f"Offset {arcap_time_offset:.2f}: 有效ARCap轨迹点不足，跳过")
             turn_point_arcap = None
             continue
 
-        turn_point_arcap = detect_turning_points(arcap_trajectory_valid)
+        summarize_trajectory(f"arcap_trajectory_valid(offset={arcap_time_offset:.2f})", arcap_trajectory_valid)
+
+        turn_point_arcap = detect_turning_points(arcap_trajectory_valid, name=f"arcap(offset={arcap_time_offset:.2f})")
         
         # pickle.dump({
         #     "aruco": aruco_trajectory,
@@ -314,10 +397,13 @@ def main(session_dir, calibration_dir, calibration_axis, init_offset):
                         [], [],
                         #turn_point_aruco, turn_point_arcap, 
                         latency_calib_dir.joinpath(f'latency_trajectory_offset{arcap_time_offset}.pdf'))
+        log("INFO", f"已保存算法1中间图: {latency_calib_dir.joinpath(f'latency_trajectory_offset{arcap_time_offset}.pdf')}")
 
         if len(turn_point_aruco) == len(turn_point_arcap):
+            log("INFO", f"算法1找到候选匹配: aruco={len(turn_point_aruco)} vs arcap={len(turn_point_arcap)}")
             break
         else:
+            log("WARN", f"算法1转向点数量不匹配: aruco={len(turn_point_aruco)} vs arcap={len(turn_point_arcap)}")
             turn_point_arcap = None
 
 
@@ -328,13 +414,13 @@ def main(session_dir, calibration_dir, calibration_axis, init_offset):
         latency_of_arcap = []
         for (t1, d1, _), (t2, d2, _) in zip(turn_point_aruco, turn_point_arcap):
             if(d1 != d2):
-                print("Direction mismatch")
+                log("WARN", f"算法1方向不匹配: aruco_direction={d1}, arcap_direction={d2}")
                 break
             latency_of_arcap.append(t2 - t1)
         else:
             if np.std(latency_of_arcap) < 0.1:
                 # everything is good
-                print(np.mean(latency_of_arcap), np.std(latency_of_arcap))
+                log("INFO", f"算法1延迟估计: mean={np.mean(latency_of_arcap):.6f}, std={np.std(latency_of_arcap):.6f}")
 
                 latency_of_arcap_result = {
                     "mean": np.mean(latency_of_arcap),
@@ -349,25 +435,35 @@ def main(session_dir, calibration_dir, calibration_axis, init_offset):
                 plot_trajectories(aruco_trajectory, calibrated_arcap_trajectory, 
                                 [], [], 
                                 latency_calib_dir.joinpath(f'latency_trajectory_final_algo_1.pdf'))
+                log("INFO", f"已保存算法1最终图: {latency_calib_dir.joinpath('latency_trajectory_final_algo_1.pdf')}")
+            else:
+                log("WARN", f"算法1延迟离散过大，放弃结果: std={np.std(latency_of_arcap):.6f}")
+    else:
+        log("WARN", "算法1未能得到有效结果，将依赖算法2")
                 
     
 
     #### algorithm 2: align by cross correlation
 
-    print("switch to algorithm 2")
+    log_section("算法2: 最小二乘误差优化")
 
     aruco_trajectory = sorted(aruco_trajectory, key=lambda x: x[0])
     timepoints = [t for t, v in aruco_trajectory]
     aruco_pos_raw = np.array([v for t, v in aruco_trajectory], dtype=float)
 
+    eval_counter = {"count": 0}
+
 
     def mse_error(x):
+        eval_counter["count"] += 1
         arcap_samples = [get_axis_value(traj_interp, t + x[0]) for t in timepoints]
         valid_mask = np.array(
             [v is not None and np.isfinite(v) for v in arcap_samples],
             dtype=bool
         )
         if np.sum(valid_mask) < 3:
+            if eval_counter["count"] <= 5:
+                log("WARN", f"mse_error@offset={x[0]:.6f}: 有效匹配点不足3个")
             return 1e6
 
         arcap_pos = np.array([v for v, m in zip(arcap_samples, valid_mask) if m], dtype=float)
@@ -376,6 +472,8 @@ def main(session_dir, calibration_dir, calibration_axis, init_offset):
         arcap_std = np.std(arcap_pos)
         aruco_std = np.std(aruco_pos)
         if arcap_std <= 1e-12 or aruco_std <= 1e-12:
+            if eval_counter["count"] <= 5:
+                log("WARN", f"mse_error@offset={x[0]:.6f}: 标准差过小 arcap_std={arcap_std:.3e}, aruco_std={aruco_std:.3e}")
             return 1e6
 
         arcap_pos = (arcap_pos - np.mean(arcap_pos)) / arcap_std
@@ -385,29 +483,37 @@ def main(session_dir, calibration_dir, calibration_axis, init_offset):
     left_offset_bound  = -1.0 + init_offset
     right_offset_bound = 1.0 + init_offset
     epsilon = 0.01
+    shift_iter = 0
     while True:
+        shift_iter += 1
+        log("INFO", f"算法2第{shift_iter}轮搜索区间: [{left_offset_bound:.3f}, {right_offset_bound:.3f}]")
         res = custom_minimize(mse_error, 0.0, bounds=[(left_offset_bound, right_offset_bound)])
         if res.x - left_offset_bound < epsilon:
+            log("WARN", f"最优值触及左边界(res={res.x[0]:.6f})，搜索区间整体左移1秒")
             left_offset_bound -= 1.0
             right_offset_bound -= 1.0
         elif right_offset_bound - res.x < epsilon:
+            log("WARN", f"最优值触及右边界(res={res.x[0]:.6f})，搜索区间整体右移1秒")
             left_offset_bound += 1.0
             right_offset_bound += 1.0
         else:
             break
 
-    print(res.x, mse_error(res.x))
+    final_error = mse_error(res.x)
+    log("INFO", f"算法2完成: best_offset={res.x[0]:.6f}, mse={final_error:.6f}, 误差评估次数={eval_counter['count']}")
         
 
     latency_of_arcap_result.update({
         "mean_2": res.x[0],
-        "error": mse_error(res.x),
+        "error": final_error,
     })
     if "mean" not in latency_of_arcap_result:
         latency_of_arcap_result["mean"] = latency_of_arcap_result["mean_2"]
         
-    with open(str(latency_calib_dir.joinpath('latency_of_arcap.json')), "w") as fp:
+    latency_json_path = latency_calib_dir.joinpath('latency_of_arcap.json')
+    with open(str(latency_json_path), "w") as fp:
         json.dump(latency_of_arcap_result, fp)
+    log("INFO", f"已保存延迟结果: {latency_json_path} -> {latency_of_arcap_result}")
 
     lat = latency_of_arcap_result["mean_2"]
     calibrated_arcap_trajectory = []
@@ -424,6 +530,9 @@ def main(session_dir, calibration_dir, calibration_axis, init_offset):
     plot_trajectories(aruco_trajectory, calibrated_arcap_trajectory, 
                     [], [], 
                     latency_calib_dir.joinpath(f'latency_trajectory_final_algo_2.pdf'))
+    log("INFO", f"已保存算法2最终图: {latency_calib_dir.joinpath('latency_trajectory_final_algo_2.pdf')}")
+    log_section("处理完成")
+    log("INFO", "ARCap时间延迟对齐执行成功")
 
 
     
@@ -434,4 +543,8 @@ def main(session_dir, calibration_dir, calibration_axis, init_offset):
 
 ## %%
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as exc:
+        log("ERROR", f"执行失败: {type(exc).__name__}: {exc}")
+        raise
