@@ -40,6 +40,7 @@ import time
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.ndimage import gaussian_filter
+from collections import Counter
 
 from umi.common.timecode_util import mp4_get_start_datetime
 
@@ -74,6 +75,202 @@ def summarize_trajectory(name, trajectory):
             f"均值={vals.mean():.6f}, 标准差={vals.std():.6f}"
         )
     )
+
+
+def save_time_overlap_plot(save_path, aruco_start, aruco_end, proprio_start, proprio_end, init_offset):
+    fig, ax = plt.subplots(1, 1, figsize=(10, 2.8))
+    ax.hlines(2.0, aruco_start, aruco_end, linewidth=8, color="#4c72b0", label="ArUco raw")
+    ax.hlines(
+        1.2,
+        aruco_start + init_offset,
+        aruco_end + init_offset,
+        linewidth=8,
+        color="#55a868",
+        label=f"ArUco + init_offset({init_offset:.2f})",
+    )
+    ax.hlines(0.4, proprio_start, proprio_end, linewidth=8, color="#dd8452", label="ARCap proprio")
+    ax.set_yticks([0.4, 1.2, 2.0])
+    ax.set_yticklabels(["ARCap", "ArUco+offset", "ArUco"])
+    ax.set_xlabel("timestamp (s)")
+    ax.set_title("Time Range Overlap Diagnosis")
+    ax.grid(True, alpha=0.25)
+    ax.legend(loc="best")
+    fig.tight_layout()
+    fig.savefig(str(save_path))
+    plt.close(fig)
+
+
+def save_offset_diagnosis_plot(save_path, offsets, valid_counts, mses, corrs, init_offset):
+    fig, axes = plt.subplots(3, 1, figsize=(10, 8), sharex=True)
+
+    axes[0].plot(offsets, valid_counts, color="#4c72b0")
+    axes[0].axhline(3, color="black", linestyle="--", linewidth=1, label="min valid=3")
+    axes[0].axvline(init_offset, color="#55a868", linestyle="--", linewidth=1, label="init_offset")
+    axes[0].set_ylabel("valid_count")
+    axes[0].set_title("Offset Diagnosis")
+    axes[0].grid(True, alpha=0.25)
+    axes[0].legend(loc="best")
+
+    axes[1].plot(offsets, mses, color="#dd8452")
+    axes[1].axvline(init_offset, color="#55a868", linestyle="--", linewidth=1)
+    axes[1].set_ylabel("mse")
+    axes[1].grid(True, alpha=0.25)
+
+    axes[2].plot(offsets, corrs, color="#8172b3")
+    axes[2].axvline(init_offset, color="#55a868", linestyle="--", linewidth=1)
+    axes[2].set_xlabel("offset (s)")
+    axes[2].set_ylabel("corr")
+    axes[2].grid(True, alpha=0.25)
+
+    fig.tight_layout()
+    fig.savefig(str(save_path))
+    plt.close(fig)
+
+
+def eval_offset_diagnostics(timepoints, aruco_vals, traj_interp, get_axis_value, offset):
+    arcap_samples = [get_axis_value(traj_interp, t + offset) for t in timepoints]
+    valid_mask = np.array([v is not None and np.isfinite(v) for v in arcap_samples], dtype=bool)
+    valid_count = int(np.sum(valid_mask))
+
+    result = {
+        "offset": float(offset),
+        "valid_count": valid_count,
+        "mse": 1e6,
+        "corr": np.nan,
+        "reason": "ok",
+    }
+
+    if valid_count < 3:
+        result["reason"] = f"valid_count_too_small({valid_count})"
+        return result
+
+    arcap_pos = np.array([v for v, m in zip(arcap_samples, valid_mask) if m], dtype=float)
+    aruco_pos = np.array([v for v, m in zip(aruco_vals, valid_mask) if m], dtype=float)
+
+    arcap_std = np.std(arcap_pos)
+    aruco_std = np.std(aruco_pos)
+    if arcap_std <= 1e-12 or aruco_std <= 1e-12:
+        result["reason"] = f"std_too_small(arcap={arcap_std:.3e}, aruco={aruco_std:.3e})"
+        return result
+
+    arcap_norm = (arcap_pos - np.mean(arcap_pos)) / arcap_std
+    aruco_norm = (aruco_pos - np.mean(aruco_pos)) / aruco_std
+    result["mse"] = float(np.mean((aruco_norm - arcap_norm) ** 2))
+    result["corr"] = float(np.corrcoef(aruco_norm, arcap_norm)[0, 1])
+    return result
+
+
+def log_turning_points_list(name, turning_points, max_items=30):
+    log("INFO", f"{name}: 转向点总数={len(turning_points)}")
+    if len(turning_points) == 0:
+        return
+    show_items = turning_points[:max_items]
+    for i, (t, d, v) in enumerate(show_items):
+        log("INFO", f"{name}[{i:02d}] t={t:.6f}, dir={int(d)}, pos={v:.6f}")
+    if len(turning_points) > max_items:
+        log("INFO", f"{name}: ... 其余 {len(turning_points)-max_items} 个点省略")
+
+
+def log_turning_points_pair_diff(name, turn_aruco, turn_arcap, max_items=30):
+    n = min(len(turn_aruco), len(turn_arcap), max_items)
+    if n == 0:
+        log("WARN", f"{name}: 无可比较转向点")
+        return
+    for i in range(n):
+        ta, da, va = turn_aruco[i]
+        tb, db, vb = turn_arcap[i]
+        log(
+            "INFO",
+            (
+                f"{name}[{i:02d}] dt={tb-ta:+.6f}s, ddir={int(db-da):+d}, "
+                f"aruco(t={ta:.6f},dir={int(da)},v={va:.6f}) vs "
+                f"arcap(t={tb:.6f},dir={int(db)},v={vb:.6f})"
+            ),
+        )
+
+
+def save_turning_points_pair_plot(save_path, turn_aruco, turn_arcap, title):
+    fig, axes = plt.subplots(2, 1, figsize=(10, 6), sharex=False)
+    fig.suptitle(title)
+
+    idx_a = np.arange(len(turn_aruco))
+    idx_b = np.arange(len(turn_arcap))
+
+    if len(turn_aruco) > 0:
+        t_a = np.array([x[0] for x in turn_aruco], dtype=float)
+        d_a = np.array([x[1] for x in turn_aruco], dtype=float)
+        axes[0].plot(idx_a, t_a, marker="o", color="#4c72b0", label="ArUco turn time")
+        axes[0].set_ylabel("turn timestamp")
+        axes[0].grid(True, alpha=0.25)
+        axes[0].legend(loc="best")
+
+        axes[1].plot(idx_a, d_a, marker="o", color="#4c72b0", label="ArUco turn dir")
+
+    if len(turn_arcap) > 0:
+        t_b = np.array([x[0] for x in turn_arcap], dtype=float)
+        d_b = np.array([x[1] for x in turn_arcap], dtype=float)
+        axes[0].plot(idx_b, t_b, marker="x", color="#dd8452", label="ARCap turn time")
+        axes[1].plot(idx_b, d_b, marker="x", color="#dd8452", label="ARCap turn dir")
+        axes[0].legend(loc="best")
+
+    axes[1].set_xlabel("turning-point index")
+    axes[1].set_ylabel("direction change")
+    axes[1].grid(True, alpha=0.25)
+    axes[1].legend(loc="best")
+
+    fig.tight_layout()
+    fig.savefig(str(save_path))
+    plt.close(fig)
+
+
+def save_zscore_shape_plot(save_path, aruco_time, aruco_raw, arcap_raw, title):
+    aruco_time = np.array(aruco_time, dtype=float)
+    aruco_raw = np.array(aruco_raw, dtype=float)
+    arcap_raw = np.array(arcap_raw, dtype=float)
+
+    aruco_std = np.std(aruco_raw)
+    arcap_std = np.std(arcap_raw)
+
+    if aruco_std <= 1e-12 or arcap_std <= 1e-12:
+        fig, ax = plt.subplots(1, 1, figsize=(10, 3.5))
+        ax.text(
+            0.5,
+            0.5,
+            f"std too small for z-score\naruco_std={aruco_std:.3e}, arcap_std={arcap_std:.3e}",
+            ha="center",
+            va="center",
+            transform=ax.transAxes,
+        )
+        ax.set_axis_off()
+        fig.tight_layout()
+        fig.savefig(str(save_path))
+        plt.close(fig)
+        return
+
+    aruco_z = (aruco_raw - np.mean(aruco_raw)) / aruco_std
+    arcap_z = (arcap_raw - np.mean(arcap_raw)) / arcap_std
+    corr = np.corrcoef(aruco_z, arcap_z)[0, 1]
+
+    t_rel = aruco_time - aruco_time[0]
+
+    fig, axes = plt.subplots(2, 1, figsize=(10, 6), sharex=True)
+    fig.suptitle(f"{title} | corr={corr:.4f}")
+
+    axes[0].plot(t_rel, aruco_z, color="#4c72b0", label="ArUco z-score")
+    axes[0].plot(t_rel, arcap_z, color="#dd8452", label="ARCap z-score")
+    axes[0].set_ylabel("z-score")
+    axes[0].grid(True, alpha=0.25)
+    axes[0].legend(loc="best")
+
+    axes[1].plot(t_rel, aruco_z - arcap_z, color="#55a868", label="z-score diff")
+    axes[1].set_xlabel("relative time (s)")
+    axes[1].set_ylabel("z_a - z_b")
+    axes[1].grid(True, alpha=0.25)
+    axes[1].legend(loc="best")
+
+    fig.tight_layout()
+    fig.savefig(str(save_path))
+    plt.close(fig)
 
 
 def detect_turning_points(data, name="trajectory"):
@@ -330,10 +527,73 @@ def main(session_dir, calibration_dir, calibration_axis, init_offset):
     log("INFO", f"[ALIGN DEBUG] overlap_ts: {overlap_start:.6f} -> {overlap_end:.6f} (overlap_sec={overlap_sec:.3f})")
     log("INFO", f"[ALIGN DEBUG] aruco_sample_head: {aruco_timepoints[:5]}")
     log("INFO", f"[ALIGN DEBUG] aruco_sample_tail: {aruco_timepoints[-5:]}")
+
+    # 诊断图1: 时间范围重叠
+    overlap_plot_path = latency_calib_dir.joinpath('latency_diag_time_overlap.pdf')
+    save_time_overlap_plot(
+        overlap_plot_path,
+        aruco_start_ts,
+        aruco_end_ts,
+        proprio_start_ts,
+        proprio_end_ts,
+        init_offset,
+    )
+    log("INFO", f"已保存时间重叠诊断图: {overlap_plot_path}")
+
     if overlap_sec <= 0:
         raise ValueError(
             "Aruco与VR时间区间无重叠，请检查init_offset、相机时间戳或姿态数据有效区间"
         )
+
+    # 诊断扫描: 不影响算法，仅用于解释为什么匹配不到
+    diag_offsets = np.arange(-6.0 + init_offset, 6.0 + init_offset + 0.025, 0.05)
+    aruco_vals = np.array([v for _, v in aruco_trajectory], dtype=float)
+    diag_stats = []
+    for i, off in enumerate(diag_offsets):
+        stat = eval_offset_diagnostics(aruco_timepoints, aruco_vals, traj_interp, get_axis_value, off)
+        diag_stats.append(stat)
+        if i % 30 == 0 or i == len(diag_offsets) - 1:
+            log(
+                "INFO",
+                (
+                    f"[DIAG SCAN] {i+1}/{len(diag_offsets)} offset={off:.2f}, "
+                    f"valid={stat['valid_count']}/{len(aruco_timepoints)}, "
+                    f"mse={stat['mse']:.6f}, corr={stat['corr']}, reason={stat['reason']}"
+                ),
+            )
+
+    fail_counter = Counter([d["reason"] for d in diag_stats])
+    for reason, count in fail_counter.most_common():
+        log("INFO", f"[DIAG SUMMARY] {reason}: {count} offsets")
+
+    valid_counts = np.array([d["valid_count"] for d in diag_stats], dtype=float)
+    mses = np.array([d["mse"] for d in diag_stats], dtype=float)
+    corrs = np.array([d["corr"] for d in diag_stats], dtype=float)
+    finite_mask = np.isfinite(mses) & (mses < 1e6)
+    if np.any(finite_mask):
+        best_diag_idx = int(np.argmin(mses))
+        log(
+            "INFO",
+            (
+                f"[DIAG BEST] offset={diag_stats[best_diag_idx]['offset']:.6f}, "
+                f"mse={diag_stats[best_diag_idx]['mse']:.6f}, "
+                f"corr={diag_stats[best_diag_idx]['corr']:.6f}, "
+                f"valid={diag_stats[best_diag_idx]['valid_count']}"
+            ),
+        )
+    else:
+        log("WARN", "[DIAG BEST] 扫描区间内无任何有效MSE点（均为惩罚值1e6）")
+
+    diag_plot_path = latency_calib_dir.joinpath('latency_diag_offset_scan.pdf')
+    save_offset_diagnosis_plot(
+        diag_plot_path,
+        diag_offsets,
+        valid_counts,
+        mses,
+        corrs,
+        init_offset,
+    )
+    log("INFO", f"已保存offset扫描诊断图: {diag_plot_path}")
 
     
     # get arcap trajectory for plotting
@@ -379,7 +639,25 @@ def main(session_dir, calibration_dir, calibration_axis, init_offset):
             (t, v) for t, v in arcap_trajectory
             if v is not None and np.isfinite(v)
         ]
+        log(
+            "INFO",
+            f"算法1@offset={arcap_time_offset:.2f}: valid_count={len(arcap_trajectory_valid)}/{len(arcap_trajectory)}"
+        )
         if len(arcap_trajectory_valid) < 3:
+            # 即使失败也保存一张“转向点对比图”，便于回看为何算法1无法匹配
+            turn_pair_plot_path = latency_calib_dir.joinpath(
+                f'latency_turning_points_compare_offset{arcap_time_offset:.2f}.pdf'
+            )
+            save_turning_points_pair_plot(
+                turn_pair_plot_path,
+                turn_point_aruco,
+                [],
+                title=(
+                    f"Turning-Points Compare offset={arcap_time_offset:.2f} | "
+                    f"FAILED: valid_count={len(arcap_trajectory_valid)}"
+                ),
+            )
+            log("INFO", f"已保存算法1转向点对比图(失败态): {turn_pair_plot_path}")
             log("WARN", f"Offset {arcap_time_offset:.2f}: 有效ARCap轨迹点不足，跳过")
             turn_point_arcap = None
             continue
@@ -387,6 +665,31 @@ def main(session_dir, calibration_dir, calibration_axis, init_offset):
         summarize_trajectory(f"arcap_trajectory_valid(offset={arcap_time_offset:.2f})", arcap_trajectory_valid)
 
         turn_point_arcap = detect_turning_points(arcap_trajectory_valid, name=f"arcap(offset={arcap_time_offset:.2f})")
+        log(
+            "INFO",
+            f"算法1@offset={arcap_time_offset:.2f}: aruco_turn={len(turn_point_aruco)}, arcap_turn={len(turn_point_arcap)}"
+        )
+
+        # 算法1诊断输出: 转向点列表与逐项差异
+        log_turning_points_list("algo1_aruco_turn", turn_point_aruco, max_items=20)
+        log_turning_points_list(f"algo1_arcap_turn@{arcap_time_offset:.2f}", turn_point_arcap, max_items=20)
+        log_turning_points_pair_diff(
+            f"algo1_turn_diff@{arcap_time_offset:.2f}",
+            turn_point_aruco,
+            turn_point_arcap,
+            max_items=20,
+        )
+
+        turn_pair_plot_path = latency_calib_dir.joinpath(
+            f'latency_turning_points_compare_offset{arcap_time_offset:.2f}.pdf'
+        )
+        save_turning_points_pair_plot(
+            turn_pair_plot_path,
+            turn_point_aruco,
+            turn_point_arcap,
+            title=f"Turning-Points Compare offset={arcap_time_offset:.2f}",
+        )
+        log("INFO", f"已保存算法1转向点对比图: {turn_pair_plot_path}")
         
         # pickle.dump({
         #     "aruco": aruco_trajectory,
@@ -500,7 +803,34 @@ def main(session_dir, calibration_dir, calibration_axis, init_offset):
             break
 
     final_error = mse_error(res.x)
+    final_diag = eval_offset_diagnostics(timepoints, aruco_pos_raw, traj_interp, get_axis_value, res.x[0])
     log("INFO", f"算法2完成: best_offset={res.x[0]:.6f}, mse={final_error:.6f}, 误差评估次数={eval_counter['count']}")
+    log(
+        "INFO",
+        (
+            f"算法2最终点诊断: valid={final_diag['valid_count']}/{len(timepoints)}, "
+            f"corr={final_diag['corr']}, reason={final_diag['reason']}"
+        )
+    )
+
+    # 算法2诊断输出: Z-score形状对比（只在有效点>=3时有意义）
+    arcap_samples_final = [get_axis_value(traj_interp, t + res.x[0]) for t in timepoints]
+    valid_mask_final = np.array(
+        [v is not None and np.isfinite(v) for v in arcap_samples_final],
+        dtype=bool
+    )
+    if int(np.sum(valid_mask_final)) >= 3:
+        zscore_plot_path = latency_calib_dir.joinpath('latency_algo2_zscore_shape_compare.pdf')
+        save_zscore_shape_plot(
+            zscore_plot_path,
+            np.array(timepoints, dtype=float)[valid_mask_final],
+            aruco_pos_raw[valid_mask_final],
+            np.array([v for v, m in zip(arcap_samples_final, valid_mask_final) if m], dtype=float),
+            title=f"Algo2 Z-score Shape Compare @ offset={res.x[0]:.6f}",
+        )
+        log("INFO", f"已保存算法2 Z-Score 形状对比图: {zscore_plot_path}")
+    else:
+        log("WARN", "算法2 Z-Score图未生成: 有效点不足3个")
         
 
     latency_of_arcap_result.update({

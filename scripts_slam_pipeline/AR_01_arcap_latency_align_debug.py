@@ -49,6 +49,11 @@ def log_section(title):
     print(f"\n[ARCAP_ALIGN_DEBUG][STEP] {'=' * 12} {title} {'=' * 12}")
 
 
+def log_progress(prefix, index, total, message):
+    ratio = 100.0 * (index + 1) / max(total, 1)
+    log("INFO", f"{prefix} [{index + 1}/{total}, {ratio:.1f}%] {message}")
+
+
 def summarize_trajectory(name, trajectory):
     if not trajectory:
         log("WARN", f"{name} 轨迹为空")
@@ -126,6 +131,7 @@ def evaluate_offset(aruco_timepoints, aruco_values, traj_interp, get_axis_value,
     corr = np.nan
     arcap_std = np.nan
     aruco_std = np.nan
+    fail_reason = "ok"
 
     if valid_count >= 3:
         arcap_pos = np.array([v for v, m in zip(arcap_samples, valid_mask) if m], dtype=float)
@@ -138,6 +144,12 @@ def evaluate_offset(aruco_timepoints, aruco_values, traj_interp, get_axis_value,
             aruco_norm = (aruco_pos - np.mean(aruco_pos)) / aruco_std
             mse = float(np.mean((aruco_norm - arcap_norm) ** 2))
             corr = float(np.corrcoef(aruco_norm, arcap_norm)[0, 1])
+        else:
+            fail_reason = (
+                f"std_too_small(arcap_std={arcap_std:.3e}, aruco_std={aruco_std:.3e})"
+            )
+    else:
+        fail_reason = f"valid_count_too_small(valid={valid_count})"
 
     return {
         "offset": float(offset),
@@ -147,6 +159,7 @@ def evaluate_offset(aruco_timepoints, aruco_values, traj_interp, get_axis_value,
         "corr": corr,
         "arcap_std": arcap_std,
         "aruco_std": aruco_std,
+        "fail_reason": fail_reason,
     }
 
 
@@ -282,8 +295,12 @@ def main(session_dir, calibration_dir, calibration_axis, init_offset, scan_min, 
         except ValueError:
             return None
 
-    calibration_dir = pathlib.Path(calibration_dir)
-    session_dir = pathlib.Path(__file__).parent.joinpath(session_dir).absolute()
+    calibration_dir = pathlib.Path(calibration_dir).expanduser()
+    session_dir = pathlib.Path(session_dir).expanduser()
+    if not session_dir.is_absolute():
+        session_dir = pathlib.Path(__file__).parent.joinpath(session_dir)
+    session_dir = session_dir.absolute()
+    calibration_dir = calibration_dir.absolute()
     latency_calib_dir = session_dir.joinpath("latency_calibration")
     debug_out_dir = latency_calib_dir.joinpath("latency_debug")
     debug_out_dir.mkdir(parents=True, exist_ok=True)
@@ -301,7 +318,10 @@ def main(session_dir, calibration_dir, calibration_axis, init_offset, scan_min, 
     if not latency_calib_dir.is_dir():
         raise FileNotFoundError(f"标定目录不存在: {latency_calib_dir}")
 
+    log("INFO", f"检查输入目录完成: latency_calibration存在={latency_calib_dir.is_dir()}")
+
     mp4_candidates = list(latency_calib_dir.glob("**/*.MP4")) + list(latency_calib_dir.glob("**/*.mp4"))
+    log("INFO", f"发现标定视频候选数量={len(mp4_candidates)}")
     calibration_mp4 = get_single_path(mp4_candidates)
     log("INFO", f"使用标定视频: {calibration_mp4}")
 
@@ -310,6 +330,7 @@ def main(session_dir, calibration_dir, calibration_axis, init_offset, scan_min, 
     proprio_start_ts = traj_interp.left_max
     proprio_end_ts = traj_interp.right_min
     log("INFO", f"VR轨迹有效时间范围: {proprio_start_ts:.6f} -> {proprio_end_ts:.6f}")
+    log("INFO", f"VR有效时长: {proprio_end_ts - proprio_start_ts:.3f}s")
 
     log_section("ArUco检测与轨迹加载")
     script_path = pathlib.Path(__file__).parent.parent.joinpath("scripts", "detect_aruco_newversion.py")
@@ -339,7 +360,7 @@ def main(session_dir, calibration_dir, calibration_axis, init_offset, scan_min, 
             "--num_workers",
             "1",
         ]
-        log("INFO", "执行ArUco检测")
+        log("INFO", "执行ArUco检测 (tag_detection.pkl不存在或启用了--force_detect)")
         t0 = time.time()
         result = subprocess.run(cmd)
         dt = time.time() - t0
@@ -364,6 +385,8 @@ def main(session_dir, calibration_dir, calibration_axis, init_offset, scan_min, 
             aruco_trajectory.append((frame["time"] + video_start_time, x))
 
     log("INFO", f"Aruco结果帧数: total={frame_total}, 含目标tag={frame_has_tag}, 轨迹点数={len(aruco_trajectory)}")
+    if frame_total > 0:
+        log("INFO", f"目标tag检出率: {100.0 * frame_has_tag / frame_total:.2f}%")
     if len(aruco_trajectory) < 3:
         raise ValueError(f"Aruco轨迹点不足(<3): {len(aruco_trajectory)}")
 
@@ -379,6 +402,8 @@ def main(session_dir, calibration_dir, calibration_axis, init_offset, scan_min, 
     overlap_end = min(proprio_end_ts, aruco_end_ts + init_offset)
     overlap_sec = max(0.0, overlap_end - overlap_start)
     log("INFO", f"overlap_sec@init_offset={init_offset:.3f} -> {overlap_sec:.3f}s")
+    log("INFO", f"ArUco时间范围: {aruco_start_ts:.6f} -> {aruco_end_ts:.6f}")
+    log("INFO", f"ARCap时间范围: {proprio_start_ts:.6f} -> {proprio_end_ts:.6f}")
 
     # 长时域图
     extend_range = 15.0
@@ -390,12 +415,19 @@ def main(session_dir, calibration_dir, calibration_axis, init_offset, scan_min, 
         ]
     )
     arcap_trajectory_for_plotting = [(t, get_axis_value(traj_interp, t + init_offset)) for t in long_times]
+    valid_long_count = int(sum(v is not None and np.isfinite(v) for _, v in arcap_trajectory_for_plotting))
+    log(
+        "INFO",
+        f"长时域采样点={len(arcap_trajectory_for_plotting)}, 有效点={valid_long_count}, "
+        f"无效点={len(arcap_trajectory_for_plotting)-valid_long_count}",
+    )
     plot_long_horizon_trajectory(
         aruco_trajectory,
         arcap_trajectory_for_plotting,
         title=f"Offset {init_offset:.3f}",
         save_dir=debug_out_dir.joinpath("01_long_horizon_offset_init.pdf"),
     )
+    log("INFO", f"已保存: {debug_out_dir.joinpath('01_long_horizon_offset_init.pdf')}")
 
     # 全局偏移扫描
     log_section("全局偏移扫描诊断")
@@ -403,10 +435,22 @@ def main(session_dir, calibration_dir, calibration_axis, init_offset, scan_min, 
     if len(scan_offsets) < 3:
         raise ValueError("扫描点太少，请增大扫描区间或减小步长")
 
-    scan_stats = [
-        evaluate_offset(aruco_timepoints, aruco_values, traj_interp, get_axis_value, offset)
-        for offset in scan_offsets
-    ]
+    log("INFO", f"扫描offset总数={len(scan_offsets)}")
+    scan_stats = []
+    for i, offset in enumerate(scan_offsets):
+        stat = evaluate_offset(aruco_timepoints, aruco_values, traj_interp, get_axis_value, offset)
+        scan_stats.append(stat)
+        # 每20步打印一次，同时确保首尾都打印
+        if i == 0 or i == len(scan_offsets) - 1 or i % 20 == 0:
+            log_progress(
+                "offset扫描",
+                i,
+                len(scan_offsets),
+                (
+                    f"offset={offset:.3f}, valid={stat['valid_count']}/{len(aruco_timepoints)}, "
+                    f"mse={stat['mse']:.6f}, corr={stat['corr']}, reason={stat['fail_reason']}"
+                ),
+            )
 
     valid_counts = [x["valid_count"] for x in scan_stats]
     save_timeline_debug_plot(
@@ -419,6 +463,7 @@ def main(session_dir, calibration_dir, calibration_axis, init_offset, scan_min, 
         scan_offsets,
         valid_counts,
     )
+    log("INFO", f"已保存: {debug_out_dir.joinpath('02_timeline_and_valid_count.pdf')}")
 
     finite_candidates = [x for x in scan_stats if x["mse"] < 1e6 and np.isfinite(x["mse"])]
     if not finite_candidates:
@@ -428,6 +473,21 @@ def main(session_dir, calibration_dir, calibration_axis, init_offset, scan_min, 
         best_scan_offset = float(min(finite_candidates, key=lambda x: x["mse"])["offset"])
         best_scan_mse = float(min(finite_candidates, key=lambda x: x["mse"])["mse"])
         log("INFO", f"扫描最佳offset={best_scan_offset:.6f}, mse={best_scan_mse:.6f}")
+        top3 = sorted(finite_candidates, key=lambda x: x["mse"])[:3]
+        for rank, item in enumerate(top3, start=1):
+            log(
+                "INFO",
+                f"Top{rank}: offset={item['offset']:.6f}, mse={item['mse']:.6f}, "
+                f"corr={item['corr']:.6f}, valid={item['valid_count']}",
+            )
+
+    # 打印失败原因分布，快速判断是“有效点不足”还是“方差过小”
+    fail_reason_count = {}
+    for item in scan_stats:
+        key = item["fail_reason"]
+        fail_reason_count[key] = fail_reason_count.get(key, 0) + 1
+    for reason, cnt in sorted(fail_reason_count.items(), key=lambda x: x[1], reverse=True):
+        log("INFO", f"扫描失败原因统计: {reason} -> {cnt} 次")
 
     # 算法1诊断图
     log_section("算法1诊断(转向点)")
@@ -445,12 +505,18 @@ def main(session_dir, calibration_dir, calibration_axis, init_offset, scan_min, 
                 "turn_count": len(turn_point_arcap),
             }
         )
+        log(
+            "INFO",
+            f"算法1@offset={offset:.2f}: valid={len(arcap_valid)}/{len(aruco_timepoints)}, "
+            f"aruco_turn={len(turn_point_aruco)}, arcap_turn={len(turn_point_arcap)}",
+        )
 
     save_turning_points_count_plot(
         debug_out_dir.joinpath("03_algo1_turning_points_vs_offset.pdf"),
         algo1_stats,
         init_offset,
     )
+    log("INFO", f"已保存: {debug_out_dir.joinpath('03_algo1_turning_points_vs_offset.pdf')}")
 
     # 选一个候选offset画算法1对齐图
     if len(scan_stats) > 0:
@@ -468,12 +534,21 @@ def main(session_dir, calibration_dir, calibration_axis, init_offset, scan_min, 
         turn_point_arcap_plot,
         debug_out_dir.joinpath("04_algo1_overlay_best_scan_offset.pdf"),
     )
+    log(
+        "INFO",
+        (
+            f"已保存: {debug_out_dir.joinpath('04_algo1_overlay_best_scan_offset.pdf')} | "
+            f"用于绘图offset={plot_offset_for_algo1:.6f}, valid={len(arcap_plot_valid)}"
+        ),
+    )
 
     # 算法2: 与原01一致，继续使用 custom_minimize 做局部优化
     log_section("算法2诊断(最小二乘)")
 
     def mse_error(x):
         stat = evaluate_offset(aruco_timepoints, aruco_values, traj_interp, get_axis_value, x[0])
+        if stat["mse"] >= 1e6:
+            log("WARN", f"mse_error@offset={x[0]:.6f}: {stat['fail_reason']}")
         return stat["mse"]
 
     left_offset_bound = -1.0 + init_offset
@@ -513,6 +588,7 @@ def main(session_dir, calibration_dir, calibration_axis, init_offset, scan_min, 
         init_offset,
         best_opt_offset,
     )
+    log("INFO", f"已保存: {debug_out_dir.joinpath('05_algo2_error_curve.pdf')}")
 
     # 算法2最终叠加图
     arcap_final = [(t + best_opt_offset, get_axis_value(traj_interp, t + best_opt_offset)) for t in aruco_timepoints]
@@ -525,6 +601,7 @@ def main(session_dir, calibration_dir, calibration_axis, init_offset, scan_min, 
         [],
         debug_out_dir.joinpath("06_algo2_overlay_final.pdf"),
     )
+    log("INFO", f"已保存: {debug_out_dir.joinpath('06_algo2_overlay_final.pdf')}")
 
     diagnosis = {
         "inputs": {
@@ -554,6 +631,7 @@ def main(session_dir, calibration_dir, calibration_axis, init_offset, scan_min, 
             "min_valid_count": int(np.min([x["valid_count"] for x in scan_stats])),
             "num_finite_candidates": len(finite_candidates),
             "best_scan_offset": best_scan_offset,
+            "fail_reason_count": fail_reason_count,
         },
         "algo2_result": {
             "best_opt_offset": best_opt_offset,
