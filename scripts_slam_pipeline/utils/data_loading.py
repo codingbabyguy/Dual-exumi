@@ -181,26 +181,32 @@ def load_proprio_interp(session_dir, latency, extend_boundary=None, rotation_min
                         pose_time_list.append(float(t))
                         pose_list.append(p_arr[:7].tolist())
 
-    pose_source = "angle_json"
+    pose_from_angle_time_list = pose_time_list
+    pose_from_angle_list = pose_list
+
+    pose_time_list = []
+    pose_list = []
+    pose_source = "pose_chunk_npz"
+    pose_chunk_files = sorted(pathlib.Path(session_dir).glob('pose/chunk_*.npz'))
+    for pose_chunk_file in pose_chunk_files:
+        with np.load(str(pose_chunk_file)) as chunk:
+            if "pose" not in chunk or "time" not in chunk:
+                continue
+            chunk_pose = np.asarray(chunk["pose"], dtype=float)
+            chunk_time = np.asarray(chunk["time"], dtype=float)
+            if chunk_pose.ndim != 2 or chunk_pose.shape[1] < 7:
+                continue
+            if len(chunk_pose) != len(chunk_time):
+                continue
+            valid_mask = np.all(np.isfinite(chunk_pose[:, :7]), axis=1)
+            if np.any(valid_mask):
+                pose_time_list.extend(chunk_time[valid_mask].tolist())
+                pose_list.extend(chunk_pose[valid_mask, :7].tolist())
+
     if len(pose_list) < 3:
-        pose_time_list = []
-        pose_list = []
-        pose_chunk_files = sorted(pathlib.Path(session_dir).glob('pose/chunk_*.npz'))
-        for pose_chunk_file in pose_chunk_files:
-            with np.load(str(pose_chunk_file)) as chunk:
-                if "pose" not in chunk or "time" not in chunk:
-                    continue
-                chunk_pose = np.asarray(chunk["pose"], dtype=float)
-                chunk_time = np.asarray(chunk["time"], dtype=float)
-                if chunk_pose.ndim != 2 or chunk_pose.shape[1] < 7:
-                    continue
-                if len(chunk_pose) != len(chunk_time):
-                    continue
-                valid_mask = np.all(np.isfinite(chunk_pose[:, :7]), axis=1)
-                if np.any(valid_mask):
-                    pose_time_list.extend(chunk_time[valid_mask].tolist())
-                    pose_list.extend(chunk_pose[valid_mask, :7].tolist())
-        pose_source = "pose_chunk_npz"
+        pose_time_list = pose_from_angle_time_list
+        pose_list = pose_from_angle_list
+        pose_source = "angle_json"
 
     if len(pose_list) < 3:
         raise OSError(
