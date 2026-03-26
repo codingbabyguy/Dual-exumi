@@ -140,6 +140,7 @@ def load_proprio_interp(session_dir, latency, extend_boundary=None, rotation_min
 
     time_list = []
     width_list = []
+    pose_time_list = []
     pose_list = []
     angle_clip_total = 0
     angle_clip_low = 0
@@ -155,8 +156,11 @@ def load_proprio_interp(session_dir, latency, extend_boundary=None, rotation_min
 
             _times  = proprio_data["timestamps"]
             _angles = [x[0] for x in proprio_data["angles"]]   # "angles": [[4063], [4063], [4063], [4063], ...]
-            _pose   = proprio_data["data"]
-            assert len(_angles) == len(_times) == len(_pose), f"Data length mismatch: {_angles} vs {_times} vs {_pose}"
+            _pose   = proprio_data.get("data", None)
+            if _pose is not None:
+                assert len(_angles) == len(_times) == len(_pose), f"Data length mismatch: {_angles} vs {_times} vs {_pose}"
+            else:
+                assert len(_angles) == len(_times), f"Data length mismatch: {_angles} vs {_times}"
 
             time_list += _times
             for x in _angles:
@@ -170,12 +174,48 @@ def load_proprio_interp(session_dir, latency, extend_boundary=None, rotation_min
                     angle_clip_high += 1
                     x_proc = as5600_to_width.right_min
                 width_list.append(float(as5600_to_width(x_proc)))
-            pose_list += _pose
+            if _pose is not None:
+                for t, p in zip(_times, _pose):
+                    p_arr = np.asarray(p, dtype=float)
+                    if p_arr.ndim == 1 and p_arr.shape[0] >= 7 and np.all(np.isfinite(p_arr[:7])):
+                        pose_time_list.append(float(t))
+                        pose_list.append(p_arr[:7].tolist())
+
+    pose_source = "angle_json"
+    if len(pose_list) < 3:
+        pose_time_list = []
+        pose_list = []
+        pose_chunk_files = sorted(pathlib.Path(session_dir).glob('pose/chunk_*.npz'))
+        for pose_chunk_file in pose_chunk_files:
+            with np.load(str(pose_chunk_file)) as chunk:
+                if "pose" not in chunk or "time" not in chunk:
+                    continue
+                chunk_pose = np.asarray(chunk["pose"], dtype=float)
+                chunk_time = np.asarray(chunk["time"], dtype=float)
+                if chunk_pose.ndim != 2 or chunk_pose.shape[1] < 7:
+                    continue
+                if len(chunk_pose) != len(chunk_time):
+                    continue
+                valid_mask = np.all(np.isfinite(chunk_pose[:, :7]), axis=1)
+                if np.any(valid_mask):
+                    pose_time_list.extend(chunk_time[valid_mask].tolist())
+                    pose_list.extend(chunk_pose[valid_mask, :7].tolist())
+        pose_source = "pose_chunk_npz"
+
+    if len(pose_list) < 3:
+        raise OSError(
+            "No valid pose data found. Checked tactile_*/angle_*.json:data and pose/chunk_*.npz"
+        )
 
     time_list = np.array(time_list)
+    pose_time_list = np.array(pose_time_list)
+
+    pose_sort_id = np.argsort(pose_time_list)
+    pose_time_list = pose_time_list[pose_sort_id]
+    pose_list = [pose_list[i] for i in pose_sort_id]
 
     width_interp = WrappedInterp1d(time_list - latency, width_list, extend_boundary=extend_boundary)
-    pose_interp  = WrappedInterp1d(time_list - latency, pose_list, extend_boundary=extend_boundary)
+    pose_interp  = WrappedInterp1d(pose_time_list - latency, pose_list, extend_boundary=extend_boundary)
     if angle_clip_total > 0:
         print(
             "WARNING: clipped out-of-range AS5600 readings "
@@ -183,6 +223,7 @@ def load_proprio_interp(session_dir, latency, extend_boundary=None, rotation_min
             f"valid_range=[{as5600_to_width.left_max}, {as5600_to_width.right_min}]"
         )
     print("proprio time range", width_interp.left_max, width_interp.right_min)
+    print(f"pose source: {pose_source}, pose_samples={len(pose_list)}")
 
     return pose_interp, width_interp
 
