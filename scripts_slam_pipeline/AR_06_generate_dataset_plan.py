@@ -137,7 +137,7 @@ def main(input, output, tcp_offset, ignore_cameras, gripper_threshold, check_rea
         end_timestamp = demo_data['end_timestamp']
         dt = 1 / demo_data['fps']
 
-        # descritize timestamps for all videos
+        # discretize timestamps for video frames (may be trimmed later)
         n_frames = demo_data['n_frames']
         demo_timestamps = np.arange(n_frames) * float(dt) + start_timestamp
 
@@ -177,12 +177,21 @@ def main(input, output, tcp_offset, ignore_cameras, gripper_threshold, check_rea
 
         # get gripper data
         this_gripper_widths = np.array(proprio_data['width'])
-            
-        # output value
-        assert len(pose_tag_tcp) == n_frames, f"{len(pose_tag_tcp)} != {n_frames}"
-        assert len(this_gripper_widths) == n_frames, f"{len(this_gripper_widths)} != {n_frames}"
-        all_cam_poses = pose_tag_tcp
-        all_gripper_widths = this_gripper_widths
+
+        # allow aligned data to be shorter than raw video when AR_03 truncates tail
+        aligned_n_frames = min(n_frames, len(pose_tag_tcp), len(this_gripper_widths))
+        if aligned_n_frames <= 0:
+            print(f"Ignored {video_dir.name}, empty aligned trajectory")
+            continue
+        if aligned_n_frames != n_frames:
+            print(
+                f"[WARN] {video_dir.name}: use aligned frames {aligned_n_frames}/{n_frames} "
+                f"(pose={len(pose_tag_tcp)}, width={len(this_gripper_widths)})"
+            )
+
+        demo_timestamps = demo_timestamps[:aligned_n_frames]
+        all_cam_poses = pose_tag_tcp[:aligned_n_frames]
+        all_gripper_widths = this_gripper_widths[:aligned_n_frames]
 
         width = all_gripper_widths
         if gripper_threshold:
@@ -202,7 +211,7 @@ def main(input, output, tcp_offset, ignore_cameras, gripper_threshold, check_rea
         # all cams
         cameras = {
             "video_path": str(video_dir.joinpath('raw_video.mp4').relative_to(video_dir.parent)),
-            "video_start_end": (0, n_frames)
+            "video_start_end": (0, aligned_n_frames)
         }
             
         all_plans.append({

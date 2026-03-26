@@ -125,16 +125,19 @@ def main(input_dir, arcap_latency_calibration_path, tactile_calibration_path, nu
         # 对齐后的数据存储
         aligned_proprio_data = []
         aligned_tactile_data = []
+        skipped_head_frames = 0
 
-        drop_demo = False  # 标记本demo是否丢弃
+        stop_reason = None
         for i_frame in range(n_frames):
             timestamp = start_timestamp + i_frame / fps
             try:
                 _pose = traj_interp(timestamp)
                 _width = width_interp(timestamp)
             except ValueError as e:
-                print(e)
-                drop_demo = True
+                if len(aligned_proprio_data) == 0:
+                    skipped_head_frames += 1
+                    continue
+                stop_reason = f"proprio out of range at frame={i_frame}, timestamp={timestamp}: {e}"
                 break
 
             # 姿态数据后处理：坐标变换到flexivbase
@@ -156,17 +159,22 @@ def main(input_dir, arcap_latency_calibration_path, tactile_calibration_path, nu
 
             # 触觉数据后处理
             _tact_data = {}
+            tactile_invalid = False
             for side in ["left", "right"]:
                 _sensor = sensor_postprocess[side]
                 try:
                     raw_img = tactile_interp[side](timestamp)
                 except ValueError as e:
-                    print(e)
-                    drop_demo = True
+                    if len(aligned_tactile_data) == 0:
+                        skipped_head_frames += 1
+                        tactile_invalid = True
+                        break
+                    stop_reason = f"tactile-{side} out of range at frame={i_frame}, timestamp={timestamp}: {e}"
+                    tactile_invalid = True
                     break
 
                 # 第一帧更新参考图像
-                if i_frame == 0:
+                if len(aligned_tactile_data) == 0:
                     _sensor.update_ref(raw_img)
 
                 img_GRAY = cv2.cvtColor(raw_img, cv2.COLOR_BGR2GRAY)
@@ -177,12 +185,35 @@ def main(input_dir, arcap_latency_calibration_path, tactile_calibration_path, nu
                 _tact_data.update({
                     f"tactile_{side}": img,
                 })
-            if drop_demo:
+            if tactile_invalid and len(aligned_tactile_data) == 0:
+                continue
+            if stop_reason is not None:
                 break
             aligned_tactile_data.append(_tact_data)
 
-        if drop_demo:
+        if len(aligned_proprio_data) == 0 or len(aligned_tactile_data) == 0:
+            print(f"[DROP] {video_dir.name}: no overlap between demo timestamps and proprio/tactile ranges")
             return False
+
+        if skipped_head_frames > 0:
+            print(f"[TRIM_HEAD] {video_dir.name}: skipped {skipped_head_frames} out-of-range head frames")
+
+        # 防御性处理：确保姿态和触觉长度一致（理论上应当一致）
+        effective_n_frames = min(len(aligned_proprio_data), len(aligned_tactile_data))
+        if effective_n_frames <= 0:
+            return False
+        if effective_n_frames != len(aligned_proprio_data) or effective_n_frames != len(aligned_tactile_data):
+            print(
+                f"[WARN] {video_dir.name}: mismatched aligned lengths "
+                f"pose={len(aligned_proprio_data)}, tactile={len(aligned_tactile_data)}, use={effective_n_frames}"
+            )
+            aligned_proprio_data = aligned_proprio_data[:effective_n_frames]
+            aligned_tactile_data = aligned_tactile_data[:effective_n_frames]
+
+        if stop_reason is not None:
+            print(
+                f"[TRUNCATE] {video_dir.name}: keep {effective_n_frames}/{n_frames} frames; {stop_reason}"
+            )
 
         # 保存对齐后的姿态数据为json
         with open(video_dir.joinpath('aligned_arcap_poses.json'), 'w') as fp:
