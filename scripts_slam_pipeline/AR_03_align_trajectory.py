@@ -229,9 +229,26 @@ def main(input_dir, arcap_latency_calibration_path, tactile_calibration_path, nu
 
     # 顺序处理所有视频
     completed = []
+    demo_stats = []
     for vid_dir, n_frame in tqdm(zip(input_video_dirs, n_frames_list),
                                 total=len(input_video_dirs), ncols=60):
-        completed.append(process_video(vid_dir, n_frame))
+        result = process_video(vid_dir, n_frame)
+        completed.append(result)
+        # 收集统计信息
+        aligned_json_path = vid_dir.joinpath('aligned_arcap_poses.json')
+        if result and aligned_json_path.is_file():
+            aligned_data = json.load(open(aligned_json_path, 'r'))
+            n_aligned_frames = len(aligned_data.get('pose', []))
+            duration_original = float(n_frame) / float(fps)
+            duration_aligned = float(n_aligned_frames) / float(fps)
+            demo_stats.append({
+                'name': vid_dir.name,
+                'original_frames': n_frame,
+                'aligned_frames': n_aligned_frames,
+                'original_duration_s': duration_original,
+                'aligned_duration_s': duration_aligned,
+                'retention_rate': 100.0 * n_aligned_frames / n_frame if n_frame > 0 else 0.0
+            })
 
     # 并行处理（注释掉，需同步）
     # with tqdm(total=len(input_video_dirs), ncols=60) as pbar:
@@ -246,10 +263,27 @@ def main(input_dir, arcap_latency_calibration_path, tactile_calibration_path, nu
     #         completed, futures = concurrent.futures.wait(futures)
     #         pbar.update(len(completed))
 
-    print("Done!")
+    print("\n" + "="*80)
+    print("[AR_03_SUMMARY] 处理完成")
+    print("="*80)
     num_of_skip = len([x for x in completed if not x])
-    if num_of_skip > 0:
-        print(f"Skipped {num_of_skip} demos from {len(input_video_dirs)}")
+    num_of_success = len([x for x in completed if x])
+    print(f"[RESULT] 成功:{num_of_success}, 失败:{num_of_skip}, 总数:{len(input_video_dirs)}")
+    
+    if demo_stats:
+        print("\n[DETAILED_STATS] 每个demo的处理结果:")
+        print("-" * 100)
+        print(f"{'Demo Name':<50} | {'Orig Frame':<10} | {'Aligned':<10} | {'Duration':<15} | {'Retention %':<12}")
+        print("-" * 100)
+        for stat in demo_stats:
+            print(
+                f"{stat['name']:<50} | "
+                f"{stat['original_frames']:<10} | "
+                f"{stat['aligned_frames']:<10} | "
+                f"{stat['original_duration_s']:.2f}s -> {stat['aligned_duration_s']:.2f}s | "
+                f"{stat['retention_rate']:.1f}%"
+            )
+        print("-" * 100)
 
 # %%
 if __name__ == "__main__":

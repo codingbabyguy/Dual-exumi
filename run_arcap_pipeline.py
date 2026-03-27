@@ -111,6 +111,19 @@ def main(session_dir, calibration_dir, gripper_threshold, calibration_axis, init
             cmd.extend(["--gripper_threshold", str(gripper_threshold)])
         result = run_step("AR_06_generate_dataset_plan", cmd)
         assert result.returncode == 0
+
+        print("############# AR_08_make_pose_demo_preview ###########")
+        script_path = script_dir.joinpath("AR_08_make_pose_demo_preview.py")
+        assert script_path.is_file()
+        cmd = [
+            'python', str(script_path),
+            '--input_dir', str(demo_dir),
+            '--full_length',
+        ]
+        result = run_step("AR_08_make_pose_demo_preview", cmd)
+        if result.returncode != 0:
+            print("[WARN] AR_08 preview generation failed, continuing...")
+        
         print(f"[SESSION DONE] {session}")
 
 ## %%

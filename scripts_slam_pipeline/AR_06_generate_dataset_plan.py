@@ -89,24 +89,37 @@ def main(input, output, tcp_offset, ignore_cameras, gripper_threshold, check_rea
                 print(f"Ignored {video_dir.name}, no {trajectory_file}")
                 continue
             
+            # 读取对齐后的数据，获得实际帧数
+            try:
+                aligned_data = json.load(open(csv_path, 'r'))
+                n_frames_aligned = len(aligned_data.get('pose', []))
+                if n_frames_aligned <= 0:
+                    print(f"Ignored {video_dir.name}, empty aligned_arcap_poses.json")
+                    continue
+            except Exception as e:
+                print(f"Ignored {video_dir.name}, error reading aligned_arcap_poses.json: {e}")
+                continue
             
             with av.open(str(mp4_path), 'r') as container:
                 stream = container.streams.video[0]
-                n_frames = stream.frames
+                n_frames_gopro = stream.frames
                 if fps is None:
                     fps = stream.average_rate
                 else:
                     if fps != stream.average_rate:
                         print(f"Inconsistent fps: {float(fps)} vs {float(stream.average_rate)} in {video_dir.name}")
                         exit(1)
-            duration_sec = float(n_frames / fps)
+            
+            # 使用对齐后的帧数计算时长（而不是GoPro原始帧数）
+            duration_sec = float(n_frames_aligned / fps)
             end_timestamp = start_timestamp + duration_sec
             
             video_meta.append({
                 'video_dir': video_dir,
                 'camera_serial': cam_serial,
                 'start_date': start_date,
-                'n_frames': n_frames,
+                'n_frames': n_frames_aligned,  # 使用对齐后的帧数
+                'n_frames_gopro': n_frames_gopro,  # 保存原始GoPro帧数供参考
                 'fps': fps,
                 'start_timestamp': start_timestamp,
                 'end_timestamp': end_timestamp

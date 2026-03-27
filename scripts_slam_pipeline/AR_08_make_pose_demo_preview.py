@@ -295,7 +295,7 @@ def render_demo(demo_dir: pathlib.Path, output_name: str, full_length: bool):
         return float(frames / fps) if fps > 1e-6 else 0.0
 
     print(
-        f"[DURATION] {demo_dir.name} | "
+        f"[AR_08_DURATION] {demo_dir.name} | "
         f"gopro={n_gopro} ({dur(n_gopro):.2f}s), "
         f"pose={n_pose} ({dur(n_pose):.2f}s), "
         f"angle={len(width)} ({dur(len(width)):.2f}s), "
@@ -400,7 +400,11 @@ def main(input_dir, output_name, full_length):
         if ok:
             ok_count += 1
 
-    print(f"Done. generated={ok_count}/{len(demo_dirs)}")
+    print(
+        f"\n[AR_08_SUMMARY] 预览视频生成完成\n"
+        f"成功: {ok_count}/{len(demo_dirs)}\n"
+        f"失败: {len(demo_dirs) - ok_count}/{len(demo_dirs)}"
+    )
 
 
 if __name__ == "__main__":
