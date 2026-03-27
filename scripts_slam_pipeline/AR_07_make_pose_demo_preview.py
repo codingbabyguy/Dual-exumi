@@ -23,7 +23,7 @@ os.chdir(ROOT_DIR)
 
 import json
 import pathlib
-from typing import Optional, Tuple
+from typing import Optional
 
 import click
 import cv2
@@ -41,33 +41,22 @@ def load_aligned_arrays(aligned_json_path: pathlib.Path):
     pose = np.asarray(data["pose"], dtype=float)
     if pose.ndim != 2 or pose.shape[1] < 7:
         raise ValueError(f"Invalid pose shape {pose.shape} in {aligned_json_path}")
+
     if "width" in data:
-        width = np.asarray(data["width"], dtype=float)
+        scalar = np.asarray(data["width"], dtype=float)
     elif "angle" in data:
-        width = np.asarray(data["angle"], dtype=float)
+        scalar = np.asarray(data["angle"], dtype=float)
     else:
-        width = np.zeros((pose.shape[0],), dtype=float)
-    if width.ndim != 1:
-        width = width.reshape(-1)
-    n = min(len(pose), len(width))
+        scalar = np.zeros((pose.shape[0],), dtype=float)
+
+    if scalar.ndim != 1:
+        scalar = scalar.reshape(-1)
+
+    n = min(len(pose), len(scalar))
     if n <= 0:
         raise ValueError(f"Empty aligned sequence in {aligned_json_path}")
-    return pose[:n], width[:n]
 
-
-def compute_projection_bounds(points_xyz: np.ndarray, margin_ratio: float = 0.08):
-    min_xyz = np.min(points_xyz, axis=0)
-    max_xyz = np.max(points_xyz, axis=0)
-    span = max_xyz - min_xyz
-    span[span < 1e-8] = 1e-8
-
-    max_span = float(np.max(span))
-    center = (min_xyz + max_xyz) * 0.5
-    half = 0.5 * max_span * (1.0 + margin_ratio * 2.0)
-
-    min_b = center - half
-    max_b = center + half
-    return min_b, max_b
+    return pose[:n], scalar[:n]
 
 
 def quat_to_rotmat_xyzw(q: np.ndarray):
@@ -85,47 +74,78 @@ def quat_to_rotmat_xyzw(q: np.ndarray):
     )
 
 
-def project_3d_to_2d(points_xyz: np.ndarray, canvas_w: int, canvas_h: int, min_b: np.ndarray, max_b: np.ndarray):
-    # Fixed view matrix for stable 3D-looking projection.
-    az = np.deg2rad(-55.0)
-    el = np.deg2rad(25.0)
-    rz = np.array(
-        [
-            [np.cos(az), -np.sin(az), 0.0],
-            [np.sin(az), np.cos(az), 0.0],
-            [0.0, 0.0, 1.0],
-        ],
-        dtype=float,
-    )
-    rx = np.array(
-        [
-            [1.0, 0.0, 0.0],
-            [0.0, np.cos(el), -np.sin(el)],
-            [0.0, np.sin(el), np.cos(el)],
-        ],
-        dtype=float,
-    )
-    view = rx @ rz
+class PoseProjector:
+    """Stable global 3D->2D projection for all frames in one demo."""
 
-    center = 0.5 * (min_b + max_b)
-    scale = float(np.max(max_b - min_b))
-    if scale < 1e-8:
-        scale = 1.0
-    pts = (points_xyz - center[None, :]) / scale
-    pv = (view @ pts.T).T
+    def __init__(self, points_xyz: np.ndarray, canvas_w: int, canvas_h: int, margin_ratio: float = 0.08):
+        self.canvas_w = canvas_w
+        self.canvas_h = canvas_h
 
-    pv_xy = pv[:, :2]
-    min_xy = np.min(pv_xy, axis=0)
-    max_xy = np.max(pv_xy, axis=0)
-    span = max_xy - min_xy
-    span[span < 1e-8] = 1e-8
-    norm = (pv_xy - min_xy[None, :]) / span[None, :]
-    x = np.clip((norm[:, 0] * (canvas_w - 1)).astype(np.int32), 0, canvas_w - 1)
-    y = np.clip(((1.0 - norm[:, 1]) * (canvas_h - 1)).astype(np.int32), 0, canvas_h - 1)
-    return np.stack([x, y], axis=1), view, center, scale
+        min_xyz = np.min(points_xyz, axis=0)
+        max_xyz = np.max(points_xyz, axis=0)
+        span = max_xyz - min_xyz
+        span[span < 1e-8] = 1e-8
+        max_span = float(np.max(span))
+        center = (min_xyz + max_xyz) * 0.5
+        half = 0.5 * max_span * (1.0 + margin_ratio * 2.0)
+
+        self.min_b = center - half
+        self.max_b = center + half
+        self.center = 0.5 * (self.min_b + self.max_b)
+        self.scale = float(np.max(self.max_b - self.min_b))
+        if self.scale < 1e-8:
+            self.scale = 1.0
+
+        az = np.deg2rad(-55.0)
+        el = np.deg2rad(25.0)
+        rz = np.array(
+            [
+                [np.cos(az), -np.sin(az), 0.0],
+                [np.sin(az), np.cos(az), 0.0],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=float,
+        )
+        rx = np.array(
+            [
+                [1.0, 0.0, 0.0],
+                [0.0, np.cos(el), -np.sin(el)],
+                [0.0, np.sin(el), np.cos(el)],
+            ],
+            dtype=float,
+        )
+        self.view = rx @ rz
+
+        pv_xy = self._project_view(points_xyz)
+        self.min_xy = np.min(pv_xy, axis=0)
+        self.max_xy = np.max(pv_xy, axis=0)
+        self.span_xy = self.max_xy - self.min_xy
+        self.span_xy[self.span_xy < 1e-8] = 1e-8
+
+    def _project_view(self, points_xyz: np.ndarray):
+        pts = (points_xyz - self.center[None, :]) / self.scale
+        pv = (self.view @ pts.T).T
+        return pv[:, :2]
+
+    def project(self, points_xyz: np.ndarray):
+        pv_xy = self._project_view(points_xyz)
+        norm = (pv_xy - self.min_xy[None, :]) / self.span_xy[None, :]
+        x = np.clip((norm[:, 0] * (self.canvas_w - 1)).astype(np.int32), 0, self.canvas_w - 1)
+        y = np.clip(((1.0 - norm[:, 1]) * (self.canvas_h - 1)).astype(np.int32), 0, self.canvas_h - 1)
+        return np.stack([x, y], axis=1)
 
 
-def draw_pose_panel(points_xyz: np.ndarray, pose_quat: np.ndarray, frame_idx: int, panel_w: int, panel_h: int):
+def build_pose_cache(points_xyz: np.ndarray, panel_w: int, panel_h: int):
+    projector = PoseProjector(points_xyz, panel_w, panel_h)
+    pix_all = projector.project(points_xyz)
+    return {
+        "projector": projector,
+        "pix_all": pix_all,
+        "points_xyz": points_xyz,
+    }
+
+
+def draw_pose_panel(pose_cache: dict, pose_quat: np.ndarray, frame_idx: int, panel_w: int, panel_h: int):
     panel = np.full((panel_h, panel_w, 3), 245, dtype=np.uint8)
 
     for gx in range(1, 4):
@@ -135,50 +155,43 @@ def draw_pose_panel(points_xyz: np.ndarray, pose_quat: np.ndarray, frame_idx: in
         y = int(gy * panel_h / 4)
         cv2.line(panel, (0, y), (panel_w - 1, y), (225, 225, 225), 1)
 
-    min_b, max_b = compute_projection_bounds(points_xyz)
-    pix, view, center, scale = project_3d_to_2d(points_xyz, panel_w, panel_h, min_b, max_b)
+    points_xyz = pose_cache["points_xyz"]
+    pix_all = pose_cache["pix_all"]
+    proj = pose_cache["projector"]
 
-    if len(pix) >= 2:
-        cv2.polylines(panel, [pix.reshape(-1, 1, 2)], False, (180, 180, 180), 1, cv2.LINE_AA)
+    if len(pix_all) >= 2:
+        cv2.polylines(panel, [pix_all.reshape(-1, 1, 2)], False, (180, 180, 180), 1, cv2.LINE_AA)
 
-    upto = min(max(frame_idx + 1, 1), len(pix))
-    past = pix[:upto]
+    valid_idx = min(max(frame_idx, 0), len(pix_all) - 1)
+    past = pix_all[: valid_idx + 1]
     if len(past) >= 2:
         cv2.polylines(panel, [past.reshape(-1, 1, 2)], False, (55, 155, 55), 2, cv2.LINE_AA)
 
-    cur = pix[upto - 1]
+    cur = pix_all[valid_idx]
     cv2.circle(panel, (int(cur[0]), int(cur[1])), 5, (50, 50, 220), -1, cv2.LINE_AA)
 
-    # Draw local orientation axes at current pose.
-    q = pose_quat[upto - 1]
+    q = pose_quat[valid_idx]
     if np.all(np.isfinite(q)):
         nq = float(np.linalg.norm(q))
         if nq > 1e-8:
             q = q / nq
             rot = quat_to_rotmat_xyzw(q)
-            pos = points_xyz[upto - 1]
-            axis_len = 0.08 * scale
+            pos = points_xyz[valid_idx]
+            axis_len = 0.08 * proj.scale
             basis = np.eye(3, dtype=float) * axis_len
             ends = pos[None, :] + (rot @ basis).T
-
-            pts = np.vstack([pos[None, :], ends])
-            pts = (pts - center[None, :]) / scale
-            pts_v = (view @ pts.T).T[:, :2]
-            mn = np.min(pts_v, axis=0)
-            mx = np.max(pts_v, axis=0)
-            sp = mx - mn
-            sp[sp < 1e-8] = 1e-8
-            uv = (pts_v - mn[None, :]) / sp[None, :]
-            uvx = np.clip((uv[:, 0] * (panel_w - 1)).astype(np.int32), 0, panel_w - 1)
-            uvy = np.clip(((1.0 - uv[:, 1]) * (panel_h - 1)).astype(np.int32), 0, panel_h - 1)
-            p0 = (int(uvx[0]), int(uvy[0]))
+            p = np.vstack([pos[None, :], ends])
+            pp = proj.project(p)
+            p0 = (int(pp[0, 0]), int(pp[0, 1]))
             colors = [(40, 40, 220), (40, 180, 40), (220, 120, 40)]
             for k in range(3):
-                p1 = (int(uvx[k + 1]), int(uvy[k + 1]))
+                p1 = (int(pp[k + 1, 0]), int(pp[k + 1, 1]))
                 cv2.line(panel, p0, p1, colors[k], 2, cv2.LINE_AA)
 
     cv2.putText(panel, "VR Pose 3D Trajectory", (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (30, 30, 30), 2, cv2.LINE_AA)
     cv2.putText(panel, f"frame={frame_idx}", (12, panel_h - 16), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (70, 70, 70), 1, cv2.LINE_AA)
+    if frame_idx >= len(points_xyz):
+        cv2.putText(panel, "pose out-of-range (hold last)", (12, panel_h - 40), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (40, 40, 180), 1, cv2.LINE_AA)
 
     return panel
 
@@ -216,6 +229,8 @@ def draw_scalar_panel(values: np.ndarray, frame_idx: int, panel_w: int, panel_h:
 
     cv2.putText(panel, title, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (30, 30, 30), 2, cv2.LINE_AA)
     cv2.putText(panel, f"min={vmin:.4f} max={vmax:.4f}", (12, panel_h - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (80, 80, 80), 1, cv2.LINE_AA)
+    if frame_idx >= len(values):
+        cv2.putText(panel, "angle out-of-range (hold last)", (12, panel_h - 32), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (40, 40, 180), 1, cv2.LINE_AA)
 
     return panel
 
@@ -242,7 +257,7 @@ def open_video_if_exists(path: pathlib.Path):
     return cap, n
 
 
-def render_demo(demo_dir: pathlib.Path, output_name: str):
+def render_demo(demo_dir: pathlib.Path, output_name: str, full_length: bool):
     gopro_path = demo_dir.joinpath("raw_video.mp4")
     tactile_left_path = demo_dir.joinpath("tactile_left.mp4")
     tactile_right_path = demo_dir.joinpath("tactile_right.mp4")
@@ -276,6 +291,18 @@ def render_demo(demo_dir: pathlib.Path, output_name: str):
             cap_right.release()
         return False, f"invalid video shape: {video_w}x{video_h}"
 
+    def dur(frames: int):
+        return float(frames / fps) if fps > 1e-6 else 0.0
+
+    print(
+        f"[DURATION] {demo_dir.name} | "
+        f"gopro={n_gopro} ({dur(n_gopro):.2f}s), "
+        f"pose={n_pose} ({dur(n_pose):.2f}s), "
+        f"angle={len(width)} ({dur(len(width)):.2f}s), "
+        f"left={n_left} ({dur(n_left):.2f}s), "
+        f"right={n_right} ({dur(n_right):.2f}s)"
+    )
+
     cell_w = video_w
     cell_h = video_h
     out_w = cell_w * 3
@@ -289,12 +316,15 @@ def render_demo(demo_dir: pathlib.Path, output_name: str):
         (out_w, out_h),
     )
 
-    counts = [n_pose, n_gopro]
-    if cap_left is not None and n_left > 0:
-        counts.append(n_left)
-    if cap_right is not None and n_right > 0:
-        counts.append(n_right)
-    n_total = int(min(counts)) if counts else 0
+    if full_length:
+        n_total = int(n_gopro)
+    else:
+        counts = [n_pose, n_gopro]
+        if cap_left is not None and n_left > 0:
+            counts.append(n_left)
+        if cap_right is not None and n_right > 0:
+            counts.append(n_right)
+        n_total = int(min(counts)) if counts else 0
 
     if n_total <= 0:
         cap_gopro.release()
@@ -305,13 +335,15 @@ def render_demo(demo_dir: pathlib.Path, output_name: str):
         writer.release()
         return False, "no overlapping frames to render"
 
+    pose_cache = build_pose_cache(points_xyz, cell_w, cell_h)
+
     n_written = 0
     for i in range(n_total):
         _, gopro_frame = read_frame_or_placeholder(cap_gopro, cell_w, cell_h, "No GoPro")
         _, left_frame = read_frame_or_placeholder(cap_left, cell_w, cell_h, "No tactile_left")
         _, right_frame = read_frame_or_placeholder(cap_right, cell_w, cell_h, "No tactile_right")
 
-        pose_panel = draw_pose_panel(points_xyz, pose_quat, i, cell_w, cell_h)
+        pose_panel = draw_pose_panel(pose_cache, pose_quat, i, cell_w, cell_h)
         angle_panel = draw_scalar_panel(width, i, cell_w, cell_h, "Gripper Angle/Width")
 
         info_panel = np.full((cell_h, cell_w, 3), 20, dtype=np.uint8)
@@ -322,6 +354,10 @@ def render_demo(demo_dir: pathlib.Path, output_name: str):
         cv2.putText(info_panel, "Panels:", (18, 192), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (180, 180, 180), 1, cv2.LINE_AA)
         cv2.putText(info_panel, "TL GoPro | TM 3D Pose | TR Angle", (18, 224), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (180, 180, 180), 1, cv2.LINE_AA)
         cv2.putText(info_panel, "BL tactile_left | BM tactile_right", (18, 252), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (180, 180, 180), 1, cv2.LINE_AA)
+        if full_length:
+            cv2.putText(info_panel, "mode=full_length (GoPro duration)", (18, 284), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (150, 210, 150), 1, cv2.LINE_AA)
+        else:
+            cv2.putText(info_panel, "mode=strict_overlap", (18, 284), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (210, 180, 150), 1, cv2.LINE_AA)
 
         row_top = np.hstack([gopro_frame, pose_panel, angle_panel])
         row_bottom = np.hstack([left_frame, right_frame, info_panel])
@@ -340,13 +376,14 @@ def render_demo(demo_dir: pathlib.Path, output_name: str):
     if n_written <= 0:
         return False, "no frames written"
 
-    return True, f"saved={out_path}, frames={n_written}"
+    return True, f"saved={out_path}, frames={n_written}, full_length={full_length}"
 
 
 @click.command()
 @click.option("-i", "--input_dir", required=True, help="demos directory path")
 @click.option("--output_name", default="multimodal_preview.mp4", show_default=True, help="output mp4 filename per demo")
-def main(input_dir, output_name):
+@click.option("--full_length/--strict_overlap", default=True, show_default=True, help="full_length: output GoPro full duration, strict_overlap: use shortest overlapping duration")
+def main(input_dir, output_name, full_length):
     input_dir = pathlib.Path(os.path.expanduser(input_dir)).absolute()
     demo_dirs = find_demo_dirs(input_dir)
     print(f"Found {len(demo_dirs)} demo dirs")
@@ -357,7 +394,7 @@ def main(input_dir, output_name):
 
     ok_count = 0
     for demo_dir in demo_dirs:
-        ok, msg = render_demo(demo_dir, output_name=output_name)
+        ok, msg = render_demo(demo_dir, output_name=output_name, full_length=full_length)
         tag = "OK" if ok else "SKIP"
         print(f"[{tag}] {demo_dir.name}: {msg}")
         if ok:
