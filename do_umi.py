@@ -316,7 +316,7 @@ def tactile_worker(
             S_N="placeholder",
             resolution=(640, 480),
             fps=fps,
-            buffer_size=350,
+            buffer_size=600,
         )
         env.start(wait=True)
         print("[Tactile] Tactile environment started.")

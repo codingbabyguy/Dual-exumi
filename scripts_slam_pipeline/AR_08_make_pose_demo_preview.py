@@ -60,6 +60,7 @@ def load_aligned_arrays(aligned_json_path: pathlib.Path):
 
 
 def quat_to_rotmat_xyzw(q: np.ndarray):
+    """四元数 [qx, qy, qz, qw] 转旋转矩阵（与visualize_pose.py一致）"""
     x, y, z, w = q
     xx, yy, zz = x * x, y * y, z * z
     xy, xz, yz = x * y, x * z, y * z
@@ -74,13 +75,14 @@ def quat_to_rotmat_xyzw(q: np.ndarray):
     )
 
 
-class PoseProjector:
-    """Stable global 3D->2D projection for all frames in one demo."""
+class SimplePoseProjector:
+    """简化版3D位姿投影器——相对坐标系显示"""
 
-    def __init__(self, points_xyz: np.ndarray, canvas_w: int, canvas_h: int, margin_ratio: float = 0.08):
+    def __init__(self, points_xyz: np.ndarray, canvas_w: int, canvas_h: int, margin_ratio: float = 0.1):
         self.canvas_w = canvas_w
         self.canvas_h = canvas_h
 
+        # 计算所有点的边界
         min_xyz = np.min(points_xyz, axis=0)
         max_xyz = np.max(points_xyz, axis=0)
         span = max_xyz - min_xyz
@@ -96,6 +98,7 @@ class PoseProjector:
         if self.scale < 1e-8:
             self.scale = 1.0
 
+        # 设置3D视图角度（仰视+旋转）
         az = np.deg2rad(-55.0)
         el = np.deg2rad(25.0)
         rz = np.array(
@@ -128,11 +131,16 @@ class PoseProjector:
         return pv[:, :2]
 
     def project(self, points_xyz: np.ndarray):
+        """投影3D点到2D画布"""
         pv_xy = self._project_view(points_xyz)
         norm = (pv_xy - self.min_xy[None, :]) / self.span_xy[None, :]
         x = np.clip((norm[:, 0] * (self.canvas_w - 1)).astype(np.int32), 0, self.canvas_w - 1)
         y = np.clip(((1.0 - norm[:, 1]) * (self.canvas_h - 1)).astype(np.int32), 0, self.canvas_h - 1)
         return np.stack([x, y], axis=1)
+
+
+# 使用SimplePoseProjector作为主力的投影器
+PoseProjector = SimplePoseProjector
 
 
 def build_pose_cache(points_xyz: np.ndarray, panel_w: int, panel_h: int):

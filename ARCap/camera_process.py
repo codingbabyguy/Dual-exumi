@@ -315,12 +315,32 @@ class TactileCamera(mp.Process):
                     for step_idx in global_idxs:
                         put_data['step_idx'] = step_idx
                         put_data['timestamp'] = t_cal
-                        self.ring_buffer.put(put_data) # , wait=False)
+                        # 重试put，处理Full异常
+                        max_retries = 3
+                        for retry_idx in range(max_retries):
+                            try:
+                                self.ring_buffer.put(put_data)
+                                break
+                            except Full:
+                                if retry_idx < max_retries - 1:
+                                    time.sleep(0.001)  # 等待1ms后重试
+                                else:
+                                    print(f"[{self.name}][WARN] 缓冲区满，放弃此帧: step_idx={step_idx}")
                 else:
                     step_idx = int((t_cal - put_start_time) * self.put_fps)
                     put_data['step_idx'] = step_idx
                     put_data['timestamp'] = t_cal
-                    self.ring_buffer.put(put_data) # , wait=False)
+                    # 重试put，处理Full异常
+                    max_retries = 3
+                    for retry_idx in range(max_retries):
+                        try:
+                            self.ring_buffer.put(put_data)
+                            break
+                        except Full:
+                            if retry_idx < max_retries - 1:
+                                time.sleep(0.001)  # 等待1ms后重试
+                            else:
+                                print(f"[{self.name}][WARN] 缓冲区满，放弃此帧: step_idx={step_idx}")
 
                 # signal ready
                 if iter_idx == 0:

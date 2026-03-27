@@ -38,7 +38,6 @@ import json
 import pickle
 import time
 import numpy as np
-import matplotlib.pyplot as plt
 from scipy.ndimage import gaussian_filter
 from collections import Counter
 
@@ -47,10 +46,10 @@ from umi.common.timecode_util import mp4_get_start_datetime
 
 from scripts_slam_pipeline.utils.constants import ARUCO_ID
 from scripts_slam_pipeline.utils.misc import (
-    get_single_path, custom_minimize, 
-    plot_trajectories, plot_long_horizon_trajectory
+    get_single_path, custom_minimize
 )
 from scripts_slam_pipeline.utils.data_loading import load_proprio_interp
+
 
 
 def log(level, message):
@@ -75,129 +74,6 @@ def summarize_trajectory(name, trajectory):
             f"均值={vals.mean():.6f}, 标准差={vals.std():.6f}"
         )
     )
-
-
-def save_time_overlap_plot(save_path, aruco_start, aruco_end, proprio_start, proprio_end, init_offset):
-    fig, ax = plt.subplots(1, 1, figsize=(10, 2.8))
-    ax.hlines(2.0, aruco_start, aruco_end, linewidth=8, color="#4c72b0", label="ArUco raw")
-    ax.hlines(
-        1.2,
-        aruco_start + init_offset,
-        aruco_end + init_offset,
-        linewidth=8,
-        color="#55a868",
-        label=f"ArUco + init_offset({init_offset:.2f})",
-    )
-    ax.hlines(0.4, proprio_start, proprio_end, linewidth=8, color="#dd8452", label="ARCap proprio")
-    ax.set_yticks([0.4, 1.2, 2.0])
-    ax.set_yticklabels(["ARCap", "ArUco+offset", "ArUco"])
-    ax.set_xlabel("timestamp (s)")
-    ax.set_title("Time Range Overlap Diagnosis")
-    ax.grid(True, alpha=0.25)
-    ax.legend(loc="best")
-    fig.tight_layout()
-    fig.savefig(str(save_path))
-    plt.close(fig)
-
-
-def save_offset_diagnosis_plot(save_path, offsets, valid_counts, mses, corrs, init_offset):
-    fig, axes = plt.subplots(3, 1, figsize=(10, 8), sharex=True)
-
-    axes[0].plot(offsets, valid_counts, color="#4c72b0")
-    axes[0].axhline(3, color="black", linestyle="--", linewidth=1, label="min valid=3")
-    axes[0].axvline(init_offset, color="#55a868", linestyle="--", linewidth=1, label="init_offset")
-    axes[0].set_ylabel("valid_count")
-    axes[0].set_title("Offset Diagnosis")
-    axes[0].grid(True, alpha=0.25)
-    axes[0].legend(loc="best")
-
-    axes[1].plot(offsets, mses, color="#dd8452")
-    axes[1].axvline(init_offset, color="#55a868", linestyle="--", linewidth=1)
-    axes[1].set_ylabel("mse")
-    axes[1].grid(True, alpha=0.25)
-
-    axes[2].plot(offsets, corrs, color="#8172b3")
-    axes[2].axvline(init_offset, color="#55a868", linestyle="--", linewidth=1)
-    axes[2].set_xlabel("offset (s)")
-    axes[2].set_ylabel("corr")
-    axes[2].grid(True, alpha=0.25)
-
-    fig.tight_layout()
-    fig.savefig(str(save_path))
-    plt.close(fig)
-
-
-def save_vr_sampling_process_plot(
-    save_path,
-    aruco_timepoints,
-    traj_interp,
-    get_axis_value,
-    init_offset,
-    candidate_offsets,
-):
-    aruco_timepoints = np.array(aruco_timepoints, dtype=float)
-    if aruco_timepoints.size == 0:
-        return
-
-    offsets = np.array(candidate_offsets, dtype=float)
-    validity = np.zeros((len(offsets), len(aruco_timepoints)), dtype=int)
-    sampled_values = np.full((len(offsets), len(aruco_timepoints)), np.nan, dtype=float)
-
-    for i, off in enumerate(offsets):
-        for j, t in enumerate(aruco_timepoints):
-            v = get_axis_value(traj_interp, t + off)
-            if v is not None and np.isfinite(v):
-                validity[i, j] = 1
-                sampled_values[i, j] = float(v)
-
-    init_idx = int(np.argmin(np.abs(offsets - init_offset)))
-    q_init = aruco_timepoints + offsets[init_idx]
-    valid_init = validity[init_idx].astype(bool)
-
-    left_min = getattr(traj_interp, "left_min", np.nan)
-    left_max = getattr(traj_interp, "left_max", np.nan)
-    right_min = getattr(traj_interp, "right_min", np.nan)
-    right_max = getattr(traj_interp, "right_max", np.nan)
-
-    fig, axes = plt.subplots(3, 1, figsize=(11, 8), sharex=False)
-
-    # 子图1: 时间范围与插值边界
-    axes[0].hlines(2.0, aruco_timepoints[0], aruco_timepoints[-1], color="#4c72b0", linewidth=8, label="ArUco raw")
-    axes[0].hlines(1.5, q_init[0], q_init[-1], color="#55a868", linewidth=8, label=f"ArUco + init_offset({offsets[init_idx]:.2f})")
-    if np.isfinite(left_min) and np.isfinite(left_max):
-        axes[0].hlines(1.0, left_min, left_max, color="#9ecae1", linewidth=10, label="VR left extension")
-    if np.isfinite(left_max) and np.isfinite(right_min):
-        axes[0].hlines(0.7, left_max, right_min, color="#dd8452", linewidth=10, label="VR strict interp range")
-    if np.isfinite(right_min) and np.isfinite(right_max):
-        axes[0].hlines(0.4, right_min, right_max, color="#fdd0a2", linewidth=10, label="VR right extension")
-    axes[0].set_yticks([0.4, 0.7, 1.0, 1.5, 2.0])
-    axes[0].set_yticklabels(["VR right ext", "VR interp", "VR left ext", "Aruco+offset", "Aruco"])
-    axes[0].set_title("VR Parsing/Sampling Time Windows")
-    axes[0].grid(True, alpha=0.25)
-    axes[0].legend(loc="best")
-
-    # 子图2: 不同offset下每个采样点的有效性
-    extent = [0, len(aruco_timepoints), offsets[0] - 0.5, offsets[-1] + 0.5]
-    axes[1].imshow(validity, aspect="auto", cmap="RdYlGn", interpolation="nearest", extent=extent, origin="lower")
-    axes[1].set_ylabel("offset (s)")
-    axes[1].set_title("Sample Validity Matrix (green=valid, red=invalid)")
-    axes[1].grid(False)
-
-    # 子图3: init_offset下采样值与有效性
-    rel_t = aruco_timepoints - aruco_timepoints[0]
-    axes[2].plot(rel_t, sampled_values[init_idx], color="#dd8452", label="VR sampled value")
-    invalid_rel_t = rel_t[~valid_init]
-    if invalid_rel_t.size > 0:
-        axes[2].scatter(invalid_rel_t, np.zeros_like(invalid_rel_t), s=12, color="red", alpha=0.7, label="invalid samples")
-    axes[2].set_xlabel("relative time from first ArUco sample (s)")
-    axes[2].set_ylabel("sampled VR value")
-    axes[2].set_title("VR Sampled Values at init_offset")
-    axes[2].grid(True, alpha=0.25)
-    axes[2].legend(loc="best")
-
-    fig.tight_layout()
-    fig.savefig(str(save_path))
-    plt.close(fig)
 
 
 def eval_offset_diagnostics(timepoints, aruco_vals, traj_interp, get_axis_value, offset):
@@ -260,90 +136,6 @@ def log_turning_points_pair_diff(name, turn_aruco, turn_arcap, max_items=30):
                 f"arcap(t={tb:.6f},dir={int(db)},v={vb:.6f})"
             ),
         )
-
-
-def save_turning_points_pair_plot(save_path, turn_aruco, turn_arcap, title):
-    fig, axes = plt.subplots(2, 1, figsize=(10, 6), sharex=False)
-    fig.suptitle(title)
-
-    idx_a = np.arange(len(turn_aruco))
-    idx_b = np.arange(len(turn_arcap))
-
-    if len(turn_aruco) > 0:
-        t_a = np.array([x[0] for x in turn_aruco], dtype=float)
-        d_a = np.array([x[1] for x in turn_aruco], dtype=float)
-        axes[0].plot(idx_a, t_a, marker="o", color="#4c72b0", label="ArUco turn time")
-        axes[0].set_ylabel("turn timestamp")
-        axes[0].grid(True, alpha=0.25)
-        axes[0].legend(loc="best")
-
-        axes[1].plot(idx_a, d_a, marker="o", color="#4c72b0", label="ArUco turn dir")
-
-    if len(turn_arcap) > 0:
-        t_b = np.array([x[0] for x in turn_arcap], dtype=float)
-        d_b = np.array([x[1] for x in turn_arcap], dtype=float)
-        axes[0].plot(idx_b, t_b, marker="x", color="#dd8452", label="ARCap turn time")
-        axes[1].plot(idx_b, d_b, marker="x", color="#dd8452", label="ARCap turn dir")
-        axes[0].legend(loc="best")
-
-    axes[1].set_xlabel("turning-point index")
-    axes[1].set_ylabel("direction change")
-    axes[1].grid(True, alpha=0.25)
-    axes[1].legend(loc="best")
-
-    fig.tight_layout()
-    fig.savefig(str(save_path))
-    plt.close(fig)
-
-
-def save_zscore_shape_plot(save_path, aruco_time, aruco_raw, arcap_raw, title):
-    aruco_time = np.array(aruco_time, dtype=float)
-    aruco_raw = np.array(aruco_raw, dtype=float)
-    arcap_raw = np.array(arcap_raw, dtype=float)
-
-    aruco_std = np.std(aruco_raw)
-    arcap_std = np.std(arcap_raw)
-
-    if aruco_std <= 1e-12 or arcap_std <= 1e-12:
-        fig, ax = plt.subplots(1, 1, figsize=(10, 3.5))
-        ax.text(
-            0.5,
-            0.5,
-            f"std too small for z-score\naruco_std={aruco_std:.3e}, arcap_std={arcap_std:.3e}",
-            ha="center",
-            va="center",
-            transform=ax.transAxes,
-        )
-        ax.set_axis_off()
-        fig.tight_layout()
-        fig.savefig(str(save_path))
-        plt.close(fig)
-        return
-
-    aruco_z = (aruco_raw - np.mean(aruco_raw)) / aruco_std
-    arcap_z = (arcap_raw - np.mean(arcap_raw)) / arcap_std
-    corr = np.corrcoef(aruco_z, arcap_z)[0, 1]
-
-    t_rel = aruco_time - aruco_time[0]
-
-    fig, axes = plt.subplots(2, 1, figsize=(10, 6), sharex=True)
-    fig.suptitle(f"{title} | corr={corr:.4f}")
-
-    axes[0].plot(t_rel, aruco_z, color="#4c72b0", label="ArUco z-score")
-    axes[0].plot(t_rel, arcap_z, color="#dd8452", label="ARCap z-score")
-    axes[0].set_ylabel("z-score")
-    axes[0].grid(True, alpha=0.25)
-    axes[0].legend(loc="best")
-
-    axes[1].plot(t_rel, aruco_z - arcap_z, color="#55a868", label="z-score diff")
-    axes[1].set_xlabel("relative time (s)")
-    axes[1].set_ylabel("z_a - z_b")
-    axes[1].grid(True, alpha=0.25)
-    axes[1].legend(loc="best")
-
-    fig.tight_layout()
-    fig.savefig(str(save_path))
-    plt.close(fig)
 
 
 def detect_turning_points(data, name="trajectory"):
@@ -601,41 +393,12 @@ def main(session_dir, calibration_dir, calibration_axis, init_offset):
     log("INFO", f"[ALIGN DEBUG] aruco_sample_head: {aruco_timepoints[:5]}")
     log("INFO", f"[ALIGN DEBUG] aruco_sample_tail: {aruco_timepoints[-5:]}")
 
-    # 诊断图1.5: VR解析与采样过程可视化
-    vr_sampling_plot_path = latency_calib_dir.joinpath('latency_diag_vr_sampling_process.pdf')
-    vr_diag_offsets = [init_offset - 2.0, init_offset - 1.0, init_offset, init_offset + 1.0, init_offset + 2.0]
-    save_vr_sampling_process_plot(
-        vr_sampling_plot_path,
-        aruco_timepoints,
-        traj_interp,
-        get_axis_value,
-        init_offset,
-        vr_diag_offsets,
-    )
-    log("INFO", f"已保存VR解析与采样过程诊断图: {vr_sampling_plot_path}")
-    for off in vr_diag_offsets:
-        vals = [get_axis_value(traj_interp, t + off) for t in aruco_timepoints]
-        valid_count = int(np.sum([v is not None and np.isfinite(v) for v in vals]))
-        log("INFO", f"[VR SAMPLE] offset={off:+.2f}, valid_count={valid_count}/{len(aruco_timepoints)}")
-
-    # 诊断图1: 时间范围重叠
-    overlap_plot_path = latency_calib_dir.joinpath('latency_diag_time_overlap.pdf')
-    save_time_overlap_plot(
-        overlap_plot_path,
-        aruco_start_ts,
-        aruco_end_ts,
-        proprio_start_ts,
-        proprio_end_ts,
-        init_offset,
-    )
-    log("INFO", f"已保存时间重叠诊断图: {overlap_plot_path}")
-
     if overlap_sec <= 0:
         raise ValueError(
             "Aruco与VR时间区间无重叠，请检查init_offset、相机时间戳或姿态数据有效区间"
         )
 
-    # 诊断扫描: 不影响算法，仅用于解释为什么匹配不到
+    # 诊断扫描: 基本的MSE评估，不生成PDF
     diag_offsets = np.arange(-6.0 + init_offset, 6.0 + init_offset + 0.025, 0.05)
     aruco_vals = np.array([v for _, v in aruco_trajectory], dtype=float)
     diag_stats = []
@@ -658,7 +421,6 @@ def main(session_dir, calibration_dir, calibration_axis, init_offset):
 
     valid_counts = np.array([d["valid_count"] for d in diag_stats], dtype=float)
     mses = np.array([d["mse"] for d in diag_stats], dtype=float)
-    corrs = np.array([d["corr"] for d in diag_stats], dtype=float)
     finite_mask = np.isfinite(mses) & (mses < 1e6)
     if np.any(finite_mask):
         best_diag_idx = int(np.argmin(mses))
@@ -674,37 +436,6 @@ def main(session_dir, calibration_dir, calibration_axis, init_offset):
     else:
         log("WARN", "[DIAG BEST] 扫描区间内无任何有效MSE点（均为惩罚值1e6）")
 
-    diag_plot_path = latency_calib_dir.joinpath('latency_diag_offset_scan.pdf')
-    save_offset_diagnosis_plot(
-        diag_plot_path,
-        diag_offsets,
-        valid_counts,
-        mses,
-        corrs,
-        init_offset,
-    )
-    log("INFO", f"已保存offset扫描诊断图: {diag_plot_path}")
-
-    
-    # get arcap trajectory for plotting
-    extend_range = 15
-    timepoints = aruco_timepoints
-    time_extend_before = np.linspace(timepoints[0]-extend_range, timepoints[0], 100).tolist()
-    time_extend_after = np.linspace(timepoints[-1], timepoints[-1]+extend_range, 100).tolist()
-    timepoints = time_extend_before + timepoints + time_extend_after
-
-    arcap_trajectory_for_plotting = [
-        (t, get_axis_value(traj_interp, t+init_offset)) 
-        for t in timepoints
-    ]
-    valid_for_plot = sum(v is not None and np.isfinite(v) for _, v in arcap_trajectory_for_plotting)
-    log("INFO", f"长时域绘图轨迹采样点={len(arcap_trajectory_for_plotting)}, 有效点={valid_for_plot}")
-    plot_long_horizon_trajectory(
-        aruco_trajectory, arcap_trajectory_for_plotting,
-        title=f"Offset {init_offset:.2f} (move arcap {'left' if init_offset > 0 else 'right'})",
-        save_dir=latency_calib_dir.joinpath(f'latency_trajectory_offset{init_offset}_long.pdf')
-    )
-    log("INFO", f"已保存长时域可视化: {latency_calib_dir.joinpath(f'latency_trajectory_offset{init_offset}_long.pdf')}")
     
 
 
@@ -734,20 +465,6 @@ def main(session_dir, calibration_dir, calibration_axis, init_offset):
             f"算法1@offset={arcap_time_offset:.2f}: valid_count={len(arcap_trajectory_valid)}/{len(arcap_trajectory)}"
         )
         if len(arcap_trajectory_valid) < 3:
-            # 即使失败也保存一张“转向点对比图”，便于回看为何算法1无法匹配
-            turn_pair_plot_path = latency_calib_dir.joinpath(
-                f'latency_turning_points_compare_offset{arcap_time_offset:.2f}.pdf'
-            )
-            save_turning_points_pair_plot(
-                turn_pair_plot_path,
-                turn_point_aruco,
-                [],
-                title=(
-                    f"Turning-Points Compare offset={arcap_time_offset:.2f} | "
-                    f"FAILED: valid_count={len(arcap_trajectory_valid)}"
-                ),
-            )
-            log("INFO", f"已保存算法1转向点对比图(失败态): {turn_pair_plot_path}")
 
             log("WARN", f"Offset {arcap_time_offset:.2f}: 有效ARCap轨迹点不足，跳过")
             turn_point_arcap = None
@@ -771,27 +488,7 @@ def main(session_dir, calibration_dir, calibration_axis, init_offset):
             max_items=20,
         )
 
-        turn_pair_plot_path = latency_calib_dir.joinpath(
-            f'latency_turning_points_compare_offset{arcap_time_offset:.2f}.pdf'
-        )
-        save_turning_points_pair_plot(
-            turn_pair_plot_path,
-            turn_point_aruco,
-            turn_point_arcap,
-            title=f"Turning-Points Compare offset={arcap_time_offset:.2f}",
-        )
-        log("INFO", f"已保存算法1转向点对比图: {turn_pair_plot_path}")
-
-        # pickle.dump({
-        #     "aruco": aruco_trajectory,
-        #     "arcap": arcap_trajectory,
-        # }, open(str(latency_calib_dir.joinpath(f'latency_data_{arcap_time_offset}.pkl')), 'wb'))
-        
-        plot_trajectories(aruco_trajectory, arcap_trajectory_valid, 
-                        [], [],
-                        #turn_point_aruco, turn_point_arcap, 
-                        latency_calib_dir.joinpath(f'latency_trajectory_offset{arcap_time_offset}.pdf'))
-        log("INFO", f"已保存算法1中间图: {latency_calib_dir.joinpath(f'latency_trajectory_offset{arcap_time_offset}.pdf')}")
+        # 仅输出诊断日志，不生成PDF图表
 
         if len(turn_point_aruco) == len(turn_point_arcap):
             log("INFO", f"算法1找到候选匹配: aruco={len(turn_point_aruco)} vs arcap={len(turn_point_arcap)}")
@@ -821,15 +518,6 @@ def main(session_dir, calibration_dir, calibration_axis, init_offset):
                     "std": np.std(latency_of_arcap),
                     "data": latency_of_arcap,
                 }
-                
-                lat = latency_of_arcap_result["mean"]
-                calibrated_arcap_trajectory = []
-                for t, v in arcap_trajectory:
-                    calibrated_arcap_trajectory.append((t-lat, v))
-                plot_trajectories(aruco_trajectory, calibrated_arcap_trajectory, 
-                                [], [], 
-                                latency_calib_dir.joinpath(f'latency_trajectory_final_algo_1.pdf'))
-                log("INFO", f"已保存算法1最终图: {latency_calib_dir.joinpath('latency_trajectory_final_algo_1.pdf')}")
             else:
                 log("WARN", f"算法1延迟离散过大，放弃结果: std={np.std(latency_of_arcap):.6f}")
     else:
@@ -910,18 +598,7 @@ def main(session_dir, calibration_dir, calibration_axis, init_offset):
         [v is not None and np.isfinite(v) for v in arcap_samples_final],
         dtype=bool
     )
-    if int(np.sum(valid_mask_final)) >= 3:
-        zscore_plot_path = latency_calib_dir.joinpath('latency_algo2_zscore_shape_compare.pdf')
-        save_zscore_shape_plot(
-            zscore_plot_path,
-            np.array(timepoints, dtype=float)[valid_mask_final],
-            aruco_pos_raw[valid_mask_final],
-            np.array([v for v, m in zip(arcap_samples_final, valid_mask_final) if m], dtype=float),
-            title=f"Algo2 Z-score Shape Compare @ offset={res.x[0]:.6f}",
-        )
-        log("INFO", f"已保存算法2 Z-Score 形状对比图: {zscore_plot_path}")
-    else:
-        log("WARN", "算法2 Z-Score图未生成: 有效点不足3个")
+    # 不生成Z-score对比图，仅保留核心结果
         
 
     latency_of_arcap_result.update({
@@ -936,22 +613,7 @@ def main(session_dir, calibration_dir, calibration_axis, init_offset):
         json.dump(latency_of_arcap_result, fp)
     log("INFO", f"已保存延迟结果: {latency_json_path} -> {latency_of_arcap_result}")
 
-    lat = latency_of_arcap_result["mean_2"]
-    calibrated_arcap_trajectory = []
-    arcap_trajectory_final = [
-        (t + lat, get_axis_value(traj_interp, t + lat))
-        for t in timepoints
-    ]
-    arcap_trajectory_final = [
-        (t, v) for t, v in arcap_trajectory_final
-        if v is not None and np.isfinite(v)
-    ]
-    for t, v in arcap_trajectory_final:
-        calibrated_arcap_trajectory.append((t - lat, v))
-    plot_trajectories(aruco_trajectory, calibrated_arcap_trajectory, 
-                    [], [], 
-                    latency_calib_dir.joinpath(f'latency_trajectory_final_algo_2.pdf'))
-    log("INFO", f"已保存算法2最终图: {latency_calib_dir.joinpath('latency_trajectory_final_algo_2.pdf')}")
+    # 算法2已完成，最终结果已保存到JSON文件
     log_section("处理完成")
     log("INFO", "ARCap时间延迟对齐执行成功")
 

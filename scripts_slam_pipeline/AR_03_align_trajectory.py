@@ -35,7 +35,6 @@ from tqdm import tqdm
 import numpy as np
 import copy
 import av
-from scipy.spatial.transform import Rotation as R
 import yaml
 
 # 工具函数：提取视频起始时间戳
@@ -49,13 +48,6 @@ from scripts_slam_pipeline.utils.data_loading import (
 )
 # 字典转换工具
 from scripts_slam_pipeline.utils.misc import listOfDict_to_dictOfList
-# 坐标变换矩阵
-from scripts_slam_pipeline.utils.constants import (
-    tx_arhand_inv,
-    tx_arbase_at_flexivbase,
-    tx_flexivobj_at_arobj,
-    tx_flexivcamera_at_flexivobj,
-)
 
 
 
@@ -140,17 +132,10 @@ def main(input_dir, arcap_latency_calibration_path, tactile_calibration_path, nu
                 stop_reason = f"proprio out of range at frame={i_frame}, timestamp={timestamp}: {e}"
                 break
 
-            # 姿态数据后处理：坐标变换到flexivbase
-            _pose = np.array(_pose)
-            assert _pose.shape == (7,), f"Invalid pose shape: {_pose.shape}, expected (6,)"
-            mat = np.identity(4)
-            mat[:3, 3] = _pose[:3]
-            mat[:3, :3] = R.from_quat(_pose[3:]).as_matrix()
-            # 坐标变换链：arhand->arbase->flexivbase->obj->camera
-            tx_obj = mat @ tx_arhand_inv
-            mat = tx_arbase_at_flexivbase @ tx_obj @ tx_flexivobj_at_arobj @ tx_flexivcamera_at_flexivobj
-            _pose[:3] = mat[:3, 3]
-            _pose[3:] = R.from_matrix(mat[:3, :3]).as_quat()
+            # 直接保存原始pose数据，不进行坐标变换
+            # 原始pose来自VR系统，已经是相对于manual_origin/manual_rotation的相对位姿
+            _pose = np.array(_pose, dtype=float)
+            assert _pose.shape == (7,), f"Invalid pose shape: {_pose.shape}, expected (7,)"
 
             aligned_proprio_data.append( {
                 'pose': _pose.tolist(),

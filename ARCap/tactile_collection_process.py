@@ -116,7 +116,21 @@ class TactileCollectionEnv:
  
         
         for camera_name, camera in self.camera_dict.items():
-            self.last_camera_data[camera_name] = camera.get_all()
+            # 重试get_all()，处理Empty异常
+            max_retries = 5
+            camera_data = None
+            for retry_idx in range(max_retries):
+                try:
+                    camera_data = camera.get_all()
+                    break
+                except Exception as e:
+                    if retry_idx < max_retries - 1:
+                        time.sleep(0.01)  # 等待10ms后重试
+                    else:
+                        print(f"[CAMERA][WARN] {camera_name}: get_all()失败 - {type(e).__name__}: {e}")
+                        camera_data = None
+            
+            self.last_camera_data[camera_name] = camera_data
             camera_data = self.last_camera_data[camera_name]
             if camera_data is None:
                 print(f"[CAMERA][WARN] {camera_name}: get_all() returned None")

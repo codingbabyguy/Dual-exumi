@@ -1,6 +1,15 @@
 """
 Main script for exUMI data process pipeline.
-python run_arcap_pipeline.py <session_dir>
+
+流程概述：
+  AR_00: 处理原始视频
+  AR_01: 时间延迟校准（不生成PDF，仅输出latency_of_arcap.json）
+  AR_03: 多模态数据对齐（删除坐标变换，直接保存原始pose）
+  AR_06: 生成数据集计划
+  AR_08: 生成预览视频（使用改进的相对坐标系位姿可视化）
+
+用法：
+  python run_arcap_pipeline.py <session_dir> [options]
 """
 
 import sys
