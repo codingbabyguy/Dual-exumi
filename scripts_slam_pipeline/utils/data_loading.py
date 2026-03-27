@@ -228,7 +228,9 @@ def load_proprio_interp(session_dir, latency, extend_boundary=None, rotation_min
             f"total={angle_clip_total}, low={angle_clip_low}, high={angle_clip_high}, "
             f"valid_range=[{as5600_to_width.left_max}, {as5600_to_width.right_min}]"
         )
-    print("proprio time range", width_interp.left_max, width_interp.right_min)
+    print("proprio(width) time range", width_interp.left_max, width_interp.right_min)
+    print("proprio(pose) query range", pose_interp.left_min, pose_interp.right_max)
+    print("proprio(pose) core range", pose_interp.left_max, pose_interp.right_min)
     print(f"pose source: {pose_source}, pose_samples={len(pose_list)}")
 
     return pose_interp, width_interp

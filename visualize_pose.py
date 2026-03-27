@@ -22,7 +22,7 @@ from matplotlib.animation import FuncAnimation, FFMpegWriter, PillowWriter
 
 # ================= 可视化参数 =================
 # 🔧 修改这里以指定你的数据文件夹路径
-DATA_FOLDER = "data/testXYZ/batch_1/pose"  # 写死的目标文件夹路径
+DATA_FOLDER = "/home/icrlab/tactile_work_Wy/data/simple-4.5/batch_3/pose"  # 写死的目标文件夹路径
 
 VIDEO_FPS = 30          # 视频帧率
 DOWNSAMPLE = 1          # 数据抽稀倍数（1=不抽稀，2=每两帧取一帧）

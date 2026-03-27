@@ -25,6 +25,18 @@ from umi.common.timecode_util import mp4_get_start_datetime
 from umi.common.pose_util import pose_to_mat, mat_to_pose
 
 
+def is_calibration_demo(video_dir: pathlib.Path):
+    meta_path = video_dir.joinpath('segment_meta.json')
+    if not meta_path.is_file():
+        return False
+    try:
+        with open(meta_path, 'r') as fp:
+            meta = json.load(fp)
+    except Exception:
+        return False
+    return bool(meta.get('is_calibration', False))
+
+
 # %%
 @click.command()
 @click.option('-i', '--input', required=True, help='Project directory')
@@ -62,6 +74,7 @@ def main(input, output, tcp_offset, ignore_cameras, gripper_threshold, check_rea
     
     # find videos
     video_dirs = sorted([x.parent for x in demos_dir.glob('demo_*/raw_video.mp4')])
+    video_dirs = [x for x in video_dirs if not is_calibration_demo(x)]
 
     # ignore camera
     ignore_cam_serials = set()
@@ -89,37 +102,24 @@ def main(input, output, tcp_offset, ignore_cameras, gripper_threshold, check_rea
                 print(f"Ignored {video_dir.name}, no {trajectory_file}")
                 continue
             
-            # 读取对齐后的数据，获得实际帧数
-            try:
-                aligned_data = json.load(open(csv_path, 'r'))
-                n_frames_aligned = len(aligned_data.get('pose', []))
-                if n_frames_aligned <= 0:
-                    print(f"Ignored {video_dir.name}, empty aligned_arcap_poses.json")
-                    continue
-            except Exception as e:
-                print(f"Ignored {video_dir.name}, error reading aligned_arcap_poses.json: {e}")
-                continue
             
             with av.open(str(mp4_path), 'r') as container:
                 stream = container.streams.video[0]
-                n_frames_gopro = stream.frames
+                n_frames = stream.frames
                 if fps is None:
                     fps = stream.average_rate
                 else:
                     if fps != stream.average_rate:
                         print(f"Inconsistent fps: {float(fps)} vs {float(stream.average_rate)} in {video_dir.name}")
                         exit(1)
-            
-            # 使用对齐后的帧数计算时长（而不是GoPro原始帧数）
-            duration_sec = float(n_frames_aligned / fps)
+            duration_sec = float(n_frames / fps)
             end_timestamp = start_timestamp + duration_sec
             
             video_meta.append({
                 'video_dir': video_dir,
                 'camera_serial': cam_serial,
                 'start_date': start_date,
-                'n_frames': n_frames_aligned,  # 使用对齐后的帧数
-                'n_frames_gopro': n_frames_gopro,  # 保存原始GoPro帧数供参考
+                'n_frames': n_frames,
                 'fps': fps,
                 'start_timestamp': start_timestamp,
                 'end_timestamp': end_timestamp
@@ -150,7 +150,7 @@ def main(input, output, tcp_offset, ignore_cameras, gripper_threshold, check_rea
         end_timestamp = demo_data['end_timestamp']
         dt = 1 / demo_data['fps']
 
-        # discretize timestamps for video frames (may be trimmed later)
+        # descritize timestamps for all videos
         n_frames = demo_data['n_frames']
         demo_timestamps = np.arange(n_frames) * float(dt) + start_timestamp
 
@@ -190,21 +190,12 @@ def main(input, output, tcp_offset, ignore_cameras, gripper_threshold, check_rea
 
         # get gripper data
         this_gripper_widths = np.array(proprio_data['width'])
-
-        # allow aligned data to be shorter than raw video when AR_03 truncates tail
-        aligned_n_frames = min(n_frames, len(pose_tag_tcp), len(this_gripper_widths))
-        if aligned_n_frames <= 0:
-            print(f"Ignored {video_dir.name}, empty aligned trajectory")
-            continue
-        if aligned_n_frames != n_frames:
-            print(
-                f"[WARN] {video_dir.name}: use aligned frames {aligned_n_frames}/{n_frames} "
-                f"(pose={len(pose_tag_tcp)}, width={len(this_gripper_widths)})"
-            )
-
-        demo_timestamps = demo_timestamps[:aligned_n_frames]
-        all_cam_poses = pose_tag_tcp[:aligned_n_frames]
-        all_gripper_widths = this_gripper_widths[:aligned_n_frames]
+            
+        # output value
+        assert len(pose_tag_tcp) == n_frames, f"{len(pose_tag_tcp)} != {n_frames}"
+        assert len(this_gripper_widths) == n_frames, f"{len(this_gripper_widths)} != {n_frames}"
+        all_cam_poses = pose_tag_tcp
+        all_gripper_widths = this_gripper_widths
 
         width = all_gripper_widths
         if gripper_threshold:
@@ -224,7 +215,7 @@ def main(input, output, tcp_offset, ignore_cameras, gripper_threshold, check_rea
         # all cams
         cameras = {
             "video_path": str(video_dir.joinpath('raw_video.mp4').relative_to(video_dir.parent)),
-            "video_start_end": (0, aligned_n_frames)
+            "video_start_end": (0, n_frames)
         }
             
         all_plans.append({

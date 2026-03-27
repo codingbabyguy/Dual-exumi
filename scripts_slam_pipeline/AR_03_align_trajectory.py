@@ -35,6 +35,7 @@ from tqdm import tqdm
 import numpy as np
 import copy
 import av
+from scipy.spatial.transform import Rotation as R
 import yaml
 
 # 工具函数：提取视频起始时间戳
@@ -48,6 +49,25 @@ from scripts_slam_pipeline.utils.data_loading import (
 )
 # 字典转换工具
 from scripts_slam_pipeline.utils.misc import listOfDict_to_dictOfList
+# 坐标变换矩阵
+from scripts_slam_pipeline.utils.constants import (
+    tx_arhand_inv,
+    tx_arbase_at_flexivbase,
+    tx_flexivobj_at_arobj,
+    tx_flexivcamera_at_flexivobj,
+)
+
+
+def is_calibration_demo(video_dir: pathlib.Path):
+    meta_path = video_dir.joinpath('segment_meta.json')
+    if not meta_path.is_file():
+        return False
+    try:
+        with open(meta_path, 'r') as fp:
+            meta = json.load(fp)
+    except Exception:
+        return False
+    return bool(meta.get('is_calibration', False))
 
 
 
@@ -70,8 +90,9 @@ def main(input_dir, arcap_latency_calibration_path, tactile_calibration_path, nu
 
     input_dir = pathlib.Path(os.path.expanduser(input_dir))
     # 获取所有demo视频目录
-    input_video_dirs = [x.parent for x in input_dir.glob('*/raw_video.mp4')]
-    print(f'Found {len(input_video_dirs)} video dirs')
+    all_video_dirs = [x.parent for x in input_dir.glob('*/raw_video.mp4')]
+    input_video_dirs = [x for x in all_video_dirs if not is_calibration_demo(x)]
+    print(f'Found {len(all_video_dirs)} video dirs, {len(input_video_dirs)} used (calibration segments skipped)')
 
     session_dir = input_dir.parent
 
@@ -111,31 +132,41 @@ def main(input_dir, arcap_latency_calibration_path, tactile_calibration_path, nu
         mp4_path = video_dir.joinpath('raw_video.mp4')
 
         # 获取视频起始时间戳
-        start_date = mp4_get_start_datetime(str(mp4_path))
-        start_timestamp = start_date.timestamp()
+        segment_meta_path = video_dir.joinpath('segment_meta.json')
+        if segment_meta_path.is_file():
+            with open(segment_meta_path, 'r') as fp:
+                segment_meta = json.load(fp)
+            start_timestamp = float(segment_meta['start_timestamp'])
+        else:
+            start_date = mp4_get_start_datetime(str(mp4_path))
+            start_timestamp = start_date.timestamp()
 
         # 对齐后的数据存储
         aligned_proprio_data = []
         aligned_tactile_data = []
-        skipped_head_frames = 0
 
-        stop_reason = None
+        drop_demo = False  # 标记本demo是否丢弃
         for i_frame in range(n_frames):
             timestamp = start_timestamp + i_frame / fps
             try:
                 _pose = traj_interp(timestamp)
                 _width = width_interp(timestamp)
             except ValueError as e:
-                if len(aligned_proprio_data) == 0:
-                    skipped_head_frames += 1
-                    continue
-                stop_reason = f"proprio out of range at frame={i_frame}, timestamp={timestamp}: {e}"
+                print(e)
+                drop_demo = True
                 break
 
-            # 直接保存原始pose数据，不进行坐标变换
-            # 原始pose来自VR系统，已经是相对于manual_origin/manual_rotation的相对位姿
-            _pose = np.array(_pose, dtype=float)
-            assert _pose.shape == (7,), f"Invalid pose shape: {_pose.shape}, expected (7,)"
+            # 姿态数据后处理：坐标变换到flexivbase
+            _pose = np.array(_pose)
+            assert _pose.shape == (7,), f"Invalid pose shape: {_pose.shape}, expected (6,)"
+            mat = np.identity(4)
+            mat[:3, 3] = _pose[:3]
+            mat[:3, :3] = R.from_quat(_pose[3:]).as_matrix()
+            # 坐标变换链：arhand->arbase->flexivbase->obj->camera
+            tx_obj = mat @ tx_arhand_inv
+            mat = tx_arbase_at_flexivbase @ tx_obj @ tx_flexivobj_at_arobj @ tx_flexivcamera_at_flexivobj
+            _pose[:3] = mat[:3, 3]
+            _pose[3:] = R.from_matrix(mat[:3, :3]).as_quat()
 
             aligned_proprio_data.append( {
                 'pose': _pose.tolist(),
@@ -144,22 +175,17 @@ def main(input_dir, arcap_latency_calibration_path, tactile_calibration_path, nu
 
             # 触觉数据后处理
             _tact_data = {}
-            tactile_invalid = False
             for side in ["left", "right"]:
                 _sensor = sensor_postprocess[side]
                 try:
                     raw_img = tactile_interp[side](timestamp)
                 except ValueError as e:
-                    if len(aligned_tactile_data) == 0:
-                        skipped_head_frames += 1
-                        tactile_invalid = True
-                        break
-                    stop_reason = f"tactile-{side} out of range at frame={i_frame}, timestamp={timestamp}: {e}"
-                    tactile_invalid = True
+                    print(e)
+                    drop_demo = True
                     break
 
                 # 第一帧更新参考图像
-                if len(aligned_tactile_data) == 0:
+                if i_frame == 0:
                     _sensor.update_ref(raw_img)
 
                 img_GRAY = cv2.cvtColor(raw_img, cv2.COLOR_BGR2GRAY)
@@ -170,35 +196,12 @@ def main(input_dir, arcap_latency_calibration_path, tactile_calibration_path, nu
                 _tact_data.update({
                     f"tactile_{side}": img,
                 })
-            if tactile_invalid and len(aligned_tactile_data) == 0:
-                continue
-            if stop_reason is not None:
+            if drop_demo:
                 break
             aligned_tactile_data.append(_tact_data)
 
-        if len(aligned_proprio_data) == 0 or len(aligned_tactile_data) == 0:
-            print(f"[DROP] {video_dir.name}: no overlap between demo timestamps and proprio/tactile ranges")
+        if drop_demo:
             return False
-
-        if skipped_head_frames > 0:
-            print(f"[TRIM_HEAD] {video_dir.name}: skipped {skipped_head_frames} out-of-range head frames")
-
-        # 防御性处理：确保姿态和触觉长度一致（理论上应当一致）
-        effective_n_frames = min(len(aligned_proprio_data), len(aligned_tactile_data))
-        if effective_n_frames <= 0:
-            return False
-        if effective_n_frames != len(aligned_proprio_data) or effective_n_frames != len(aligned_tactile_data):
-            print(
-                f"[WARN] {video_dir.name}: mismatched aligned lengths "
-                f"pose={len(aligned_proprio_data)}, tactile={len(aligned_tactile_data)}, use={effective_n_frames}"
-            )
-            aligned_proprio_data = aligned_proprio_data[:effective_n_frames]
-            aligned_tactile_data = aligned_tactile_data[:effective_n_frames]
-
-        if stop_reason is not None:
-            print(
-                f"[TRUNCATE] {video_dir.name}: keep {effective_n_frames}/{n_frames} frames; {stop_reason}"
-            )
 
         # 保存对齐后的姿态数据为json
         with open(video_dir.joinpath('aligned_arcap_poses.json'), 'w') as fp:
@@ -214,26 +217,9 @@ def main(input_dir, arcap_latency_calibration_path, tactile_calibration_path, nu
 
     # 顺序处理所有视频
     completed = []
-    demo_stats = []
     for vid_dir, n_frame in tqdm(zip(input_video_dirs, n_frames_list),
                                 total=len(input_video_dirs), ncols=60):
-        result = process_video(vid_dir, n_frame)
-        completed.append(result)
-        # 收集统计信息
-        aligned_json_path = vid_dir.joinpath('aligned_arcap_poses.json')
-        if result and aligned_json_path.is_file():
-            aligned_data = json.load(open(aligned_json_path, 'r'))
-            n_aligned_frames = len(aligned_data.get('pose', []))
-            duration_original = float(n_frame) / float(fps)
-            duration_aligned = float(n_aligned_frames) / float(fps)
-            demo_stats.append({
-                'name': vid_dir.name,
-                'original_frames': n_frame,
-                'aligned_frames': n_aligned_frames,
-                'original_duration_s': duration_original,
-                'aligned_duration_s': duration_aligned,
-                'retention_rate': 100.0 * n_aligned_frames / n_frame if n_frame > 0 else 0.0
-            })
+        completed.append(process_video(vid_dir, n_frame))
 
     # 并行处理（注释掉，需同步）
     # with tqdm(total=len(input_video_dirs), ncols=60) as pbar:
@@ -248,27 +234,10 @@ def main(input_dir, arcap_latency_calibration_path, tactile_calibration_path, nu
     #         completed, futures = concurrent.futures.wait(futures)
     #         pbar.update(len(completed))
 
-    print("\n" + "="*80)
-    print("[AR_03_SUMMARY] 处理完成")
-    print("="*80)
+    print("Done!")
     num_of_skip = len([x for x in completed if not x])
-    num_of_success = len([x for x in completed if x])
-    print(f"[RESULT] 成功:{num_of_success}, 失败:{num_of_skip}, 总数:{len(input_video_dirs)}")
-    
-    if demo_stats:
-        print("\n[DETAILED_STATS] 每个demo的处理结果:")
-        print("-" * 100)
-        print(f"{'Demo Name':<50} | {'Orig Frame':<10} | {'Aligned':<10} | {'Duration':<15} | {'Retention %':<12}")
-        print("-" * 100)
-        for stat in demo_stats:
-            print(
-                f"{stat['name']:<50} | "
-                f"{stat['original_frames']:<10} | "
-                f"{stat['aligned_frames']:<10} | "
-                f"{stat['original_duration_s']:.2f}s -> {stat['aligned_duration_s']:.2f}s | "
-                f"{stat['retention_rate']:.1f}%"
-            )
-        print("-" * 100)
+    if num_of_skip > 0:
+        print(f"Skipped {num_of_skip} demos from {len(input_video_dirs)}")
 
 # %%
 if __name__ == "__main__":

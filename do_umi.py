@@ -6,6 +6,7 @@ Usage:
 
 Controls:
     w: start a new batch (creates batch_N subfolder)
+    u: mark current timestamp as a new trajectory start within current batch
     e: end current batch (flush and stop saving)
     d: delete current batch data and restart current batch id
     q: quit
@@ -26,6 +27,7 @@ import select
 import tty
 import termios
 import socket
+import json
 from datetime import datetime
 
 import numpy as np
@@ -118,6 +120,23 @@ class SharedState:
         self.vr_dir = None
         self.tactile_dir = None
         self.tactile_folder_name = None
+        self.trajectory_marks = []
+
+    @staticmethod
+    def marks_filename():
+        return "capture_marks.json"
+
+    def _persist_marks_locked(self):
+        if self.current_batch_dir is None:
+            return
+        marks_path = os.path.join(self.current_batch_dir, self.marks_filename())
+        payload = {
+            "batch_id": self.batch_id,
+            "created_at": datetime.now().isoformat(),
+            "trajectory_start_timestamps": list(self.trajectory_marks),
+        }
+        with open(marks_path, "w", encoding="utf-8") as fp:
+            json.dump(payload, fp, indent=2)
 
     def start_batch(self):
         with self.lock:
@@ -140,12 +159,32 @@ class SharedState:
             self.current_batch_dir = batch_dir
             self.vr_dir = vr_dir
             self.tactile_dir = tactile_dir
+            self.trajectory_marks = []
+            self._persist_marks_locked()
             print(f"[INFO] Batch {self.batch_id} started. Directories created:")
             print(f"  - VR数据: {vr_dir}")
             print(f"  - 触觉数据: {tactile_dir}")
             print(f"  - 标定视频: {batch_dir}/latency_calibration")
             print(f"  - 原始视频: {batch_dir}/raw_videos")
+            print(f"  - 轨迹打点文件: {batch_dir}/{self.marks_filename()}")
             return batch_dir
+
+    def mark_trajectory_start(self):
+        with self.lock:
+            if not self.batch_active or self.current_batch_dir is None:
+                return None
+
+            ts = time.time()
+            self.trajectory_marks.append(ts)
+            self._persist_marks_locked()
+
+            return {
+                "batch_id": self.batch_id,
+                "timestamp": ts,
+                "readable": timestamp_to_readable(ts),
+                "index": len(self.trajectory_marks),
+                "path": os.path.join(self.current_batch_dir, self.marks_filename()),
+            }
 
     def end_batch(self):
         with self.lock:
@@ -161,11 +200,16 @@ class SharedState:
             print(f"  - 触觉数据: {finished_dir}/{self.tactile_folder_name}/")
             print(f"  - 标定视频: {finished_dir}/latency_calibration/")
             print(f"  - 原始视频: {finished_dir}/raw_videos/")
+            print(f"  - 轨迹打点数: {len(self.trajectory_marks)}")
+            print(f"  - 打点文件: {finished_dir}/{self.marks_filename()}")
+
+            self._persist_marks_locked()
             
             self.current_batch_dir = None
             self.vr_dir = None
             self.tactile_dir = None
             self.tactile_folder_name = None
+            self.trajectory_marks = []
             self.batch_id += 1
             return finished_dir
 
@@ -177,12 +221,13 @@ class SharedState:
                 "tactile_dir": self.tactile_dir,
                 "batch_id": self.batch_id,
                 "batch_dir": self.current_batch_dir,
+                "mark_count": len(self.trajectory_marks),
             }
 
     def status_text(self):
         with self.lock:
             mode = "采集中" if self.batch_active else "待机"
-            return f"当前batch: {self.batch_id} | 状态: {mode}"
+            return f"当前batch: {self.batch_id} | 状态: {mode} | 打点数: {len(self.trajectory_marks)}"
 
     def delete_and_restart_current_batch(self):
         with self.lock:
@@ -204,6 +249,8 @@ class SharedState:
 
             self.vr_dir = vr_dir
             self.tactile_dir = tactile_dir
+            self.trajectory_marks = []
+            self._persist_marks_locked()
             return {
                 "batch_dir": batch_dir,
                 "vr_dir": vr_dir,
@@ -446,7 +493,7 @@ def main():
         print("  ├── tactile_YYYYMMDD_HHMMSS/  # 触觉数据文件夹")
         print("  ├── latency_calibration/ # 标定视频(预留)")
         print("  └── raw_videos/         # 原始视频(预留)")
-        print("[MAIN] 按 'w' 开始batch, 'e' 结束当前batch, 'd' 删除并重采当前batch, 'q' 退出")
+        print("[MAIN] 按 'w' 开始batch, 'u' 记录轨迹起点, 'e' 结束当前batch, 'd' 删除并重采当前batch, 'q' 退出")
 
         state = SharedState(root_dir)
         stop_event = threading.Event()
@@ -474,6 +521,17 @@ def main():
                         batch_dir = state.start_batch()
                         if batch_dir:
                             print(f"[MAIN] 开始 batch: {batch_dir}")
+                        print(f"[MAIN][STATUS] {state.status_text()}")
+                    elif key == "u":
+                        mark_info = state.mark_trajectory_start()
+                        if mark_info:
+                            print(
+                                f"[MAIN] 轨迹打点 #{mark_info['index']}: {mark_info['readable']} "
+                                f"(Unix {mark_info['timestamp']:.6f})"
+                            )
+                            print(f"[MAIN] 打点文件已更新: {mark_info['path']}")
+                        else:
+                            print("[MAIN] 当前没有进行中的 batch，无法记录打点。")
                         print(f"[MAIN][STATUS] {state.status_text()}")
                     elif key == "e":
                         finished_dir = state.end_batch()
