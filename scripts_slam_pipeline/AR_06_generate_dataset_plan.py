@@ -16,6 +16,7 @@ import click
 import pickle
 import numpy as np
 import json
+import re
 import numpy as np
 from scipy.spatial.transform import Rotation
 from tqdm import tqdm
@@ -35,6 +36,56 @@ def is_calibration_demo(video_dir: pathlib.Path):
     except Exception:
         return False
     return bool(meta.get('is_calibration', False))
+
+
+def resolve_camera_serial(video_dir: pathlib.Path, session_dir: pathlib.Path, et: ExifToolHelper):
+    """Resolve camera serial robustly for segmented videos.
+
+    Priority:
+    1) metadata on demo raw_video.mp4
+    2) segment_meta.json::camera_serial
+    3) metadata on source_video from segment_meta.json
+    4) parse from demo folder name: demo_<serial>_<timestamp>
+    """
+    mp4_path = video_dir.joinpath('raw_video.mp4')
+
+    # 1) Direct metadata from current demo video
+    try:
+        meta = list(et.get_metadata(str(mp4_path)))[0]
+        serial = meta.get('QuickTime:CameraSerialNumber', None)
+        if serial:
+            return str(serial)
+    except Exception:
+        pass
+
+    # 2) / 3) segment_meta fallback
+    meta_path = video_dir.joinpath('segment_meta.json')
+    if meta_path.is_file():
+        try:
+            with open(meta_path, 'r') as fp:
+                seg_meta = json.load(fp)
+
+            serial = seg_meta.get('camera_serial', None)
+            if serial:
+                return str(serial)
+
+            source_rel = seg_meta.get('source_video', None)
+            if source_rel:
+                source_abs = session_dir.joinpath(source_rel)
+                if source_abs.is_file():
+                    source_meta = list(et.get_metadata(str(source_abs)))[0]
+                    serial = source_meta.get('QuickTime:CameraSerialNumber', None)
+                    if serial:
+                        return str(serial)
+        except Exception:
+            pass
+
+    # 4) folder name fallback: demo_<serial>_<timestamp>
+    m = re.match(r'^demo_([^_]+)_', video_dir.name)
+    if m is not None:
+        return m.group(1)
+
+    return "UNKNOWN_CAMERA"
 
 
 # %%
@@ -87,8 +138,7 @@ def main(input, output, tcp_offset, ignore_cameras, gripper_threshold, check_rea
     with ExifToolHelper() as et:
         for video_dir in video_dirs:            
             mp4_path = video_dir.joinpath('raw_video.mp4')
-            meta = list(et.get_metadata(str(mp4_path)))[0]
-            cam_serial = meta['QuickTime:CameraSerialNumber']
+            cam_serial = resolve_camera_serial(video_dir, input_path, et)
             start_date = mp4_get_start_datetime(str(mp4_path))
             start_timestamp = start_date.timestamp()
 

@@ -25,6 +25,7 @@ import click
 import subprocess
 import shlex
 import time
+import json
 
 
 def run_step(step_name, cmd):
@@ -36,12 +37,49 @@ def run_step(step_name, cmd):
     print(f"[END] {step_name} | returncode={result.returncode} | elapsed={elapsed:.2f}s")
     return result
 
+
+def load_alignment_window(session: pathlib.Path):
+    path = session.joinpath('latency_calibration', 'alignment_window.json')
+    if not path.is_file():
+        return None, path
+    with open(path, 'r') as fp:
+        return json.load(fp), path
+
+
+def confirm_after_alignment(session: pathlib.Path):
+    report, report_path = load_alignment_window(session)
+    if report is not None:
+        print("[ALIGN][REPORT] 对齐窗口摘要:")
+        print(f"  - 标定视频: {report.get('calibration_video')}")
+        print(
+            "  - 视频内对齐区间: "
+            f"{report.get('aruco_rel_start_sec', 0.0):.3f}s ~ {report.get('aruco_rel_end_sec', 0.0):.3f}s "
+            f"(总长 {report.get('video_duration_sec', 0.0):.3f}s)"
+        )
+        print(
+            "  - 位于整段视频前: "
+            f"{report.get('aruco_window_start_pct', 0.0):.2f}% ~ {report.get('aruco_window_end_pct', 0.0):.2f}%"
+        )
+        if report.get('matched_pose_start_unix') is not None and report.get('matched_pose_end_unix') is not None:
+            print(
+                "  - 匹配到的VR时间段: "
+                f"{report.get('matched_pose_start_unix'):.6f} ~ {report.get('matched_pose_end_unix'):.6f}"
+            )
+        if report.get('mse_error') is not None:
+            print(f"  - 匹配误差MSE: {report.get('mse_error'):.6f}")
+        print(f"  - 报告文件: {report_path}")
+    else:
+        print(f"[ALIGN][WARN] 未找到对齐窗口报告: {report_path}")
+
+    confirm = input("[PROMPT] 输入 yes 继续后续切分与处理，输入其它任意内容跳过该 session: ").strip()
+    return confirm.lower() == 'yes'
+
 # %%
 @click.command()
 @click.argument('session_dir', nargs=-1)
 @click.option('-c', '--calibration_dir', type=str, default=None)
 @click.option('-gth', '--gripper_threshold', type=float, default=None, help="")
-@click.option('--calibration_axis', type=str, default="x", help='')
+@click.option('--calibration_axis', type=str, default="y", help='')
 @click.option('--init_offset', type=float, default=0)
 @click.option('--only_calib', is_flag=True, default=False, help="only run calibration")
 @click.option('--skip_calib', is_flag=True, default=False, help="skip the calibration")
@@ -60,20 +98,7 @@ def main(session_dir, calibration_dir, gripper_threshold, calibration_axis, init
         session = pathlib.Path(__file__).parent.joinpath(session).absolute()
         print(f"\n[SESSION] {session}")
 
-        print("############## AR_00_process_videos #############")
-        script_path = script_dir.joinpath("AR_00_process_videos.py")
-        assert script_path.is_file()
-        cmd = [
-            'python', str(script_path),
-            str(session)
-        ]
-        result = run_step("AR_00_process_videos", cmd)
-        assert result.returncode == 0
-        
-        demo_dir = session.joinpath('demos')
-        print(f"[INFO] demo_dir={demo_dir}")
-
-
+        latency_json_path = session.joinpath('latency_calibration', 'latency_of_arcap.json')
         if not skip_calib:
             print("############## AR_01_arcap_latency_align #############")
             script_path = script_dir.joinpath("AR_01_arcap_latency_align.py")
@@ -90,10 +115,32 @@ def main(session_dir, calibration_dir, gripper_threshold, calibration_axis, init
         else:
             print("[SKIP] AR_01_arcap_latency_align (skip_calib=True)")
 
+        if not latency_json_path.is_file():
+            raise FileNotFoundError(
+                f"Missing latency file: {latency_json_path}. Please run AR_01 first."
+            )
+
         if only_calib:
             print("[SKIP] Remaining steps (only_calib=True)")
             continue
-        
+
+        if not confirm_after_alignment(session):
+            print("[ABORT] 用户未输入 yes，跳过该 session 后续流程。")
+            continue
+
+        print("############## AR_00_process_videos #############")
+        script_path = script_dir.joinpath("AR_00_process_videos.py")
+        assert script_path.is_file()
+        cmd = [
+            'python', str(script_path),
+            '--latency_json', str(latency_json_path),
+            str(session)
+        ]
+        result = run_step("AR_00_process_videos", cmd)
+        assert result.returncode == 0
+
+        demo_dir = session.joinpath('demos')
+        print(f"[INFO] demo_dir={demo_dir}")
 
         print("############# AR_03_align_trajectory ###########")
         script_path = script_dir.joinpath("AR_03_align_trajectory.py")
@@ -101,7 +148,7 @@ def main(session_dir, calibration_dir, gripper_threshold, calibration_axis, init
         cmd = [
             'python', str(script_path),
             '--input_dir', str(demo_dir),
-            '-calib', str(session.joinpath('latency_calibration/latency_of_arcap.json')),
+            '-calib', str(latency_json_path),
             '-tactile_calib', 'ARCap/tactile_calib/shape_config.yaml',
         ]
         result = run_step("AR_03_align_trajectory", cmd)

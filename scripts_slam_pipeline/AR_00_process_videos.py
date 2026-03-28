@@ -63,6 +63,19 @@ def _load_capture_marks(session_path: pathlib.Path):
     return marks, marks_path
 
 
+def _load_latency_value(latency_json_path):
+    if latency_json_path is None:
+        return None
+    path = pathlib.Path(os.path.expanduser(latency_json_path)).absolute()
+    if not path.is_file():
+        raise FileNotFoundError(f"Latency json not found: {path}")
+    with open(path, "r", encoding="utf-8") as fp:
+        data = json.load(fp)
+    if "mean" not in data:
+        raise KeyError(f"Missing 'mean' in latency json: {path}")
+    return float(data["mean"])
+
+
 def _time_to_str(ts_unix: float):
     return datetime.fromtimestamp(ts_unix).strftime(r"%Y.%m.%d_%H.%M.%S.%f")
 
@@ -159,7 +172,8 @@ def _segment_video_by_marks(mp4_path, output_dir, cam_serial, start_ts, marks, s
 # %%
 @click.command(help='Session directories. Assumming mp4 videos are in <session_dir>/raw_videos')
 @click.argument('session_dir', nargs=-1)
-def main(session_dir):
+@click.option('--latency_json', type=str, default=None, help='latency_of_arcap.json path for projecting marks to video time')
+def main(session_dir, latency_json):
     """
     视频预处理主函数
     
@@ -186,6 +200,17 @@ def main(session_dir):
             print(f"Loaded {len(marks)} trajectory marks from {marks_path}")
         else:
             print("No capture_marks.json found, fallback to original AR_00 behavior.")
+
+        latency_value = _load_latency_value(latency_json)
+        if latency_value is not None and marks:
+            projected_marks = [m - latency_value for m in marks]
+            print(
+                f"Loaded latency mean={latency_value:.6f}. "
+                "Using projected video marks = pose_mark - latency."
+            )
+            for i, (m0, m1) in enumerate(zip(marks, projected_marks), start=1):
+                print(f"  mark#{i}: pose={m0:.6f} -> video={m1:.6f}")
+            marks = projected_marks
 
         
         # 检查raw_videos目录是否存在

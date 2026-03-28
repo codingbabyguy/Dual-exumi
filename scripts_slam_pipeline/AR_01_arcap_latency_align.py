@@ -38,6 +38,7 @@ import json
 import pickle
 import numpy as np
 import matplotlib.pyplot as plt
+import av
 from scipy.ndimage import gaussian_filter
 
 from umi.common.timecode_util import mp4_get_start_datetime
@@ -52,7 +53,22 @@ from scripts_slam_pipeline.utils.data_loading import load_proprio_interp
 
 
 def find_calibration_video(session_dir: pathlib.Path):
-    """Find calibration video path from latency_calibration first, then demos with segment_meta."""
+    """Find calibration video path with priority: raw_videos -> latency_calibration -> demos(segment_meta)."""
+    raw_dir = session_dir.joinpath('raw_videos')
+    if raw_dir.is_dir():
+        mp4_candidates = list(raw_dir.glob('**/*.MP4')) + list(raw_dir.glob('**/*.mp4'))
+        if len(mp4_candidates) > 0:
+            if len(mp4_candidates) == 1:
+                return mp4_candidates[0], "raw_videos"
+            dated = []
+            for p in mp4_candidates:
+                try:
+                    dated.append((mp4_get_start_datetime(str(p)).timestamp(), p))
+                except Exception:
+                    dated.append((float('inf'), p))
+            dated.sort(key=lambda x: x[0])
+            return dated[0][1], "raw_videos"
+
     latency_calib_dir = session_dir.joinpath('latency_calibration')
     if latency_calib_dir.is_dir():
         mp4_candidates = list(latency_calib_dir.glob('**/*.MP4')) + list(latency_calib_dir.glob('**/*.mp4'))
@@ -80,8 +96,36 @@ def find_calibration_video(session_dir: pathlib.Path):
         return meta_candidates[0][1], "demos_segment_meta"
 
     raise FileNotFoundError(
-        f"No calibration video found in {latency_calib_dir} and no is_calibration segment in {demos_dir}"
+        f"No calibration video found in raw_videos, {latency_calib_dir}, or no is_calibration segment in {demos_dir}"
     )
+
+
+def get_video_start_timestamp(calibration_mp4: pathlib.Path):
+    """Resolve absolute start timestamp for calibration video."""
+    meta_path = calibration_mp4.parent.joinpath('segment_meta.json')
+    if meta_path.is_file():
+        with open(meta_path, 'r') as fp:
+            meta = json.load(fp)
+        if 'start_timestamp' in meta:
+            return float(meta['start_timestamp']), 'segment_meta'
+
+    try:
+        return mp4_get_start_datetime(str(calibration_mp4)).timestamp(), 'mp4_timecode'
+    except Exception as e:
+        raise RuntimeError(
+            f"Cannot resolve start timestamp for {calibration_mp4}. "
+            f"Need MP4 timecode or segment_meta.json with start_timestamp. Original error: {e}"
+        )
+
+
+def get_video_duration_sec(calibration_mp4: pathlib.Path):
+    with av.open(str(calibration_mp4), 'r') as container:
+        stream = container.streams.video[0]
+        if stream.frames and stream.average_rate:
+            return float(stream.frames / stream.average_rate)
+        if stream.duration is not None and stream.time_base is not None:
+            return float(stream.duration * stream.time_base)
+    raise RuntimeError(f"Cannot determine video duration for {calibration_mp4}")
 
 
 def detect_turning_points(data):
@@ -155,9 +199,11 @@ def detect_turning_points(data):
 @click.command()
 @click.argument('session_dir')
 @click.option('-c', '--calibration_dir', required=True, help='标定文件目录路径')
-@click.option('--calibration_axis', type=str, default="x", help='用于对齐的坐标轴(x/y/z)')
+@click.option('--calibration_axis', type=str, default="y", help='用于对齐的坐标轴(x/y/z)')
 @click.option('--init_offset', type=float, default=0, help='初始时间偏移估计值(秒)')
-def main(session_dir, calibration_dir, calibration_axis, init_offset):
+@click.option('--calib_max_rel_sec', type=float, default=8.0, show_default=True,
+              help='仅使用视频前N秒内检测到的ArUco点做标定')
+def main(session_dir, calibration_dir, calibration_axis, init_offset, calib_max_rel_sec):
     """
     时间延迟对齐主函数
     
@@ -223,169 +269,248 @@ def main(session_dir, calibration_dir, calibration_axis, init_offset):
     assert camera_intrinsics.is_file(), f"相机内参文件不存在: {camera_intrinsics}"
     assert aruco_config.is_file(), f"ArUco配置文件不存在: {aruco_config}"
     
-    # 运行ArUco检测（如果结果文件不存在）
+    # 运行ArUco检测（如果结果文件不存在，或缓存来自不同视频）
     aruco_out_dir = latency_calib_dir.joinpath('tag_detection.pkl')
-    if not aruco_out_dir.is_file():
+    aruco_meta_path = latency_calib_dir.joinpath('tag_detection_meta.json')
+    current_video_stat = calibration_mp4.stat()
+    aruco_need_run = not aruco_out_dir.is_file()
+    if not aruco_need_run and aruco_meta_path.is_file():
+        try:
+            with open(aruco_meta_path, 'r') as fp:
+                cached_meta = json.load(fp)
+            cached_input = cached_meta.get('input_video', '')
+            cached_size = int(cached_meta.get('input_size', -1))
+            cached_mtime_ns = int(cached_meta.get('input_mtime_ns', -1))
+            aruco_need_run = (
+                cached_input != str(calibration_mp4)
+                or cached_size != int(current_video_stat.st_size)
+                or cached_mtime_ns != int(current_video_stat.st_mtime_ns)
+            )
+        except Exception:
+            aruco_need_run = True
+    elif not aruco_need_run and not aruco_meta_path.is_file():
+        aruco_need_run = True
+
+    if aruco_need_run:
         cmd = [
-            'python', script_path,
+            'python', str(script_path),
             '--input', str(calibration_mp4),        # 输入标定视频
             '--output', str(aruco_out_dir),         # 输出检测结果
-            '--intrinsics_json', camera_intrinsics, # 相机内参文件
+            '--intrinsics_json', str(camera_intrinsics), # 相机内参文件
             '--aruco_yaml', str(aruco_config),      # ArUco配置文件
             '--num_workers', '1'                    # 单线程处理
         ]
         print(f"执行ArUco检测命令: {' '.join(cmd)}")
         result = subprocess.run(cmd)
         assert result.returncode == 0, "ArUco检测失败"
+        with open(aruco_meta_path, 'w') as fp:
+            json.dump({
+                'input_video': str(calibration_mp4),
+                'input_size': int(current_video_stat.st_size),
+                'input_mtime_ns': int(current_video_stat.st_mtime_ns),
+            }, fp)
     else:
         print(f"tag_detection.pkl已存在，跳过ArUco检测: {calibration_mp4}")
 
 
     print("align visual and trajectory")
 
-    # get aruco trajectory
-    video_start_time = mp4_get_start_datetime(str(calibration_mp4)).timestamp()
+    # get aruco trajectory in video-relative time first
+    video_start_time, video_start_source = get_video_start_timestamp(calibration_mp4)
+    video_duration = get_video_duration_sec(calibration_mp4)
 
     aruco_pickle_path = latency_calib_dir.joinpath('tag_detection.pkl')
     with open(str(aruco_pickle_path), "rb") as fp:
         aruco_pkl = pickle.load(fp)
-        aruco_trajectory = []
+        aruco_trajectory_rel = []
         for frame in aruco_pkl:
             if ARUCO_ID in frame['tag_dict']:
                 x = frame['tag_dict'][ARUCO_ID]['tvec'][0]    # x-axis
-                aruco_trajectory.append((frame['time']+video_start_time, x))
+                t_rel = float(frame['time'])
+                aruco_trajectory_rel.append((t_rel, float(x)))
 
-    
-    # get arcap trajectory for plotting
-    extend_range = 15
-    timepoints = sorted([t for t, _ in aruco_trajectory])
-    time_extend_before = np.linspace(timepoints[0]-extend_range, timepoints[0], 100).tolist()
-    time_extend_after = np.linspace(timepoints[-1], timepoints[-1]+extend_range, 100).tolist()
-    timepoints = time_extend_before + timepoints + time_extend_after
-
-    arcap_trajectory_for_plotting = [
-        (t, get_axis_value(traj_interp, t+init_offset)) 
-        for t in timepoints
+    raw_detect_count = len(aruco_trajectory_rel)
+    aruco_trajectory_rel = [
+        (t_rel, x) for t_rel, x in aruco_trajectory_rel
+        if 0.0 <= t_rel <= float(calib_max_rel_sec)
     ]
-    plot_long_horizon_trajectory(
-        aruco_trajectory, arcap_trajectory_for_plotting,
-        title=f"Offset {init_offset:.2f} (move arcap {'left' if init_offset > 0 else 'right'})",
-        save_dir=latency_calib_dir.joinpath(f'latency_trajectory_offset{init_offset}_long.pdf')
+
+    print(
+        f"[ALIGN] ArUco点筛选: 原始={raw_detect_count}, "
+        f"前{calib_max_rel_sec:.3f}s内保留={len(aruco_trajectory_rel)}"
     )
-    
 
+    if len(aruco_trajectory_rel) == 0:
+        raise RuntimeError(
+            f"No ArUco points found within first {calib_max_rel_sec:.3f}s in {calibration_mp4}. "
+            f"Raw detected points={raw_detect_count}."
+        )
 
-    ###### algorithm 1: align by turning points
-    turn_point_aruco = detect_turning_points(aruco_trajectory)
-    turn_point_arcap = None
+    if len(aruco_trajectory_rel) < 30:
+        raise RuntimeError(
+            f"Too few ArUco points within first {calib_max_rel_sec:.3f}s: {len(aruco_trajectory_rel)}. "
+            "Please increase --calib_max_rel_sec or improve marker visibility."
+        )
 
-    for arcap_time_offset in [0.0, 1.0, -1.0, 2.0, -2.0]:
-        arcap_time_offset += init_offset
+    aruco_rel_start = min(t for t, _ in aruco_trajectory_rel)
+    aruco_rel_end = max(t for t, _ in aruco_trajectory_rel)
+    aruco_abs_start = video_start_time + aruco_rel_start
+    aruco_abs_end = video_start_time + aruco_rel_end
+    start_pct = 100.0 * aruco_rel_start / video_duration
+    end_pct = 100.0 * aruco_rel_end / video_duration
 
-        # get arcap trajectory
-        arcap_trajectory = []
-        timepoints = [t+arcap_time_offset for t, _ in aruco_trajectory]
-        timepoints = sorted(timepoints)
-        for t in timepoints:
-            arcap_trajectory.append( ( t, get_axis_value(traj_interp, t) ) )
-        turn_point_arcap = detect_turning_points(arcap_trajectory)
-        
-        # pickle.dump({
-        #     "aruco": aruco_trajectory,
-        #     "arcap": arcap_trajectory,
-        # }, open(str(latency_calib_dir.joinpath(f'latency_data_{arcap_time_offset}.pkl')), 'wb'))
-        
-        plot_trajectories(aruco_trajectory, arcap_trajectory, 
-                        [], [],
-                        #turn_point_aruco, turn_point_arcap, 
-                        latency_calib_dir.joinpath(f'latency_trajectory_offset{arcap_time_offset}.pdf'))
+    print("[ALIGN] 可用于对齐的ArUco时间段:")
+    print(f"[ALIGN]  绝对时间: {aruco_abs_start:.6f} ~ {aruco_abs_end:.6f}")
+    print(f"[ALIGN]  视频内时间: {aruco_rel_start:.3f}s ~ {aruco_rel_end:.3f}s (总长 {video_duration:.3f}s)")
+    print(f"[ALIGN]  位于整段视频前 {start_pct:.2f}% ~ {end_pct:.2f}%")
 
-        if len(turn_point_aruco) == len(turn_point_arcap):
-            break
-        else:
-            turn_point_arcap = None
+    alignment_window = {
+        'calibration_video': str(calibration_mp4),
+        'calib_max_rel_sec': float(calib_max_rel_sec),
+        'aruco_detected_points_raw': int(raw_detect_count),
+        'aruco_points_used': int(len(aruco_trajectory_rel)),
+        'video_start_time_unix': float(video_start_time),
+        'video_start_source': video_start_source,
+        'video_duration_sec': float(video_duration),
+        'aruco_abs_start_unix': float(aruco_abs_start),
+        'aruco_abs_end_unix': float(aruco_abs_end),
+        'aruco_rel_start_sec': float(aruco_rel_start),
+        'aruco_rel_end_sec': float(aruco_rel_end),
+        'aruco_window_start_pct': float(start_pct),
+        'aruco_window_end_pct': float(end_pct),
+    }
+    with open(latency_calib_dir.joinpath('alignment_window.json'), 'w') as fp:
+        json.dump(alignment_window, fp, indent=2)
 
+    # ---- Global matching in VR timeline (do not assume absolute clock sync) ----
+    aruco_trajectory_rel = sorted(aruco_trajectory_rel, key=lambda x: x[0])
+    tv_min = aruco_trajectory_rel[0][0]
+    tv_max = aruco_trajectory_rel[-1][0]
 
-    latency_of_arcap_result = {}
-        
-    if turn_point_arcap is not None:
-        # algorithm 1 is good
-        latency_of_arcap = []
-        for (t1, d1, _), (t2, d2, _) in zip(turn_point_aruco, turn_point_arcap):
-            if(d1 != d2):
-                print("Direction mismatch")
-                break
-            latency_of_arcap.append(t2 - t1)
-        else:
-            if np.std(latency_of_arcap) < 0.1:
-                # everything is good
-                print(np.mean(latency_of_arcap), np.std(latency_of_arcap))
+    # Search t_pose = t_video_rel + b across the full valid VR timeline.
+    left_bound = float(traj_interp.left_max - tv_max)
+    right_bound = float(traj_interp.right_min - tv_min)
+    if left_bound >= right_bound:
+        raise RuntimeError(
+            f"Invalid offset search range: [{left_bound}, {right_bound}] with tv=[{tv_min}, {tv_max}]"
+        )
 
-                latency_of_arcap_result = {
-                    "mean": np.mean(latency_of_arcap),
-                    "std": np.std(latency_of_arcap),
-                    "data": latency_of_arcap,
-                }
-                
-                lat = latency_of_arcap_result["mean"]
-                calibrated_arcap_trajectory = []
-                for t, v in arcap_trajectory:
-                    calibrated_arcap_trajectory.append((t-lat, v))
-                plot_trajectories(aruco_trajectory, calibrated_arcap_trajectory, 
-                                [], [], 
-                                latency_calib_dir.joinpath(f'latency_trajectory_final_algo_1.pdf'))
-                
-    
+    print("[ALIGN] 在整段VR轨迹上搜索最优时间映射: t_pose = t_video_rel + b")
+    print(f"[ALIGN] 搜索区间 b: {left_bound:.6f} ~ {right_bound:.6f}")
 
-    #### algorithm 2: align by cross correlation
+    def collect_pairs(offset_b):
+        pairs = []
+        for t_rel, x_aruco in aruco_trajectory_rel:
+            t_pose = t_rel + offset_b
+            v_pose = get_axis_value(traj_interp, t_pose)
+            if v_pose is None:
+                continue
+            if not np.isfinite(v_pose):
+                continue
+            pairs.append((t_rel, t_pose, x_aruco, float(v_pose)))
+        return pairs
 
-    print("switch to algorithm 2")
+    def pairs_mse(pairs):
+        if len(pairs) < 30:
+            return np.inf
+        aruco_pos = np.array([p[2] for p in pairs], dtype=np.float64)
+        pose_pos = np.array([p[3] for p in pairs], dtype=np.float64)
+        astd = float(np.std(aruco_pos))
+        pstd = float(np.std(pose_pos))
+        if astd < 1e-8 or pstd < 1e-8:
+            return np.inf
+        aruco_pos = (aruco_pos - np.mean(aruco_pos)) / astd
+        pose_pos = (pose_pos - np.mean(pose_pos)) / pstd
+        return float(np.mean((aruco_pos - pose_pos) ** 2))
 
-    aruco_trajectory = sorted(aruco_trajectory, key=lambda x: x[0])
-    timepoints = [t for t, v in aruco_trajectory]
-    aruco_pos = np.array([v for t, v in aruco_trajectory])
-    aruco_pos = (aruco_pos - np.mean(aruco_pos)) / np.std(aruco_pos)  # normalized
+    # coarse search for robust initialization
+    coarse_count = 400
+    coarse_grid = np.linspace(left_bound, right_bound, coarse_count)
+    coarse_scores = []
+    best_b = None
+    best_score = np.inf
+    best_pairs = []
+    for b in coarse_grid:
+        pairs = collect_pairs(float(b))
+        score = pairs_mse(pairs)
+        coarse_scores.append(score)
+        if score < best_score:
+            best_score = score
+            best_b = float(b)
+            best_pairs = pairs
 
+    if best_b is None or not np.isfinite(best_score):
+        raise RuntimeError("Failed to find any valid overlap between ArUco trajectory and VR trajectory.")
+
+    coarse_step = (right_bound - left_bound) / max(1, coarse_count - 1)
+    refine_left = max(left_bound, best_b - 5.0 * coarse_step)
+    refine_right = min(right_bound, best_b + 5.0 * coarse_step)
 
     def mse_error(x):
-        arcap_pos = np.array([get_axis_value(traj_interp, t+x[0]) for t in timepoints])
-        arcap_pos = (arcap_pos - np.mean(arcap_pos)) / np.std(arcap_pos)
-        return np.mean((aruco_pos - arcap_pos)**2)
+        pairs = collect_pairs(float(x[0]))
+        return pairs_mse(pairs)
 
-    left_offset_bound  = -1.0 + init_offset
-    right_offset_bound = 1.0 + init_offset
-    epsilon = 0.01
-    while True:
-        res = custom_minimize(mse_error, 0.0, bounds=[(left_offset_bound, right_offset_bound)])
-        if res.x - left_offset_bound < epsilon:
-            left_offset_bound -= 1.0
-            right_offset_bound -= 1.0
-        elif right_offset_bound - res.x < epsilon:
-            left_offset_bound += 1.0
-            right_offset_bound += 1.0
-        else:
-            break
+    res = custom_minimize(mse_error, 0.0, bounds=[(refine_left, refine_right)])
+    best_b = float(res.x[0])
+    best_pairs = collect_pairs(best_b)
+    best_score = pairs_mse(best_pairs)
 
-    print(res.x, mse_error(res.x))
-        
+    if len(best_pairs) < 30 or not np.isfinite(best_score):
+        raise RuntimeError(
+            "Global matching did not find enough valid samples after refinement. "
+            f"pairs={len(best_pairs)}, score={best_score}"
+        )
 
-    latency_of_arcap_result.update({
-        "mean_2": res.x[0],
-        "error": mse_error(res.x),
-    })
-    if "mean" not in latency_of_arcap_result:
-        latency_of_arcap_result["mean"] = latency_of_arcap_result["mean_2"]
-        
+    matched_pose_start = min(p[1] for p in best_pairs)
+    matched_pose_end = max(p[1] for p in best_pairs)
+    matched_rel_start = min(p[0] for p in best_pairs)
+    matched_rel_end = max(p[0] for p in best_pairs)
+
+    print(f"[ALIGN] 最优映射 b={best_b:.6f}, mse={best_score:.6f}, 样本数={len(best_pairs)}")
+    print(f"[ALIGN] 匹配到的VR时间段: {matched_pose_start:.6f} ~ {matched_pose_end:.6f}")
+    print(f"[ALIGN] 匹配到的视频相对时间段: {matched_rel_start:.3f}s ~ {matched_rel_end:.3f}s")
+
+    # latency used by AR_00 projection: video_abs = pose - latency
+    latency_mean = float(best_b - video_start_time)
+
+    latency_of_arcap_result = {
+        "mean": latency_mean,
+        "mean_2": latency_mean,
+        "error": float(best_score),
+        "mapping_b_pose_from_video_rel": float(best_b),
+        "matched_pairs": int(len(best_pairs)),
+        "matched_pose_start": float(matched_pose_start),
+        "matched_pose_end": float(matched_pose_end),
+        "matched_video_rel_start": float(matched_rel_start),
+        "matched_video_rel_end": float(matched_rel_end),
+    }
+
     with open(str(latency_calib_dir.joinpath('latency_of_arcap.json')), "w") as fp:
-        json.dump(latency_of_arcap_result, fp)
+        json.dump(latency_of_arcap_result, fp, indent=2)
 
-    lat = latency_of_arcap_result["mean_2"]
-    calibrated_arcap_trajectory = []
-    for t, v in arcap_trajectory:
-        calibrated_arcap_trajectory.append((t-lat, v))
-    plot_trajectories(aruco_trajectory, calibrated_arcap_trajectory, 
-                    [], [], 
-                    latency_calib_dir.joinpath(f'latency_trajectory_final_algo_2.pdf'))
+    alignment_window.update({
+        'matched_pose_start_unix': float(matched_pose_start),
+        'matched_pose_end_unix': float(matched_pose_end),
+        'matched_video_rel_start_sec': float(matched_rel_start),
+        'matched_video_rel_end_sec': float(matched_rel_end),
+        'mapping_b_pose_from_video_rel': float(best_b),
+        'latency_mean_pose_minus_video': float(latency_mean),
+        'mse_error': float(best_score),
+        'matched_pairs': int(len(best_pairs)),
+    })
+    with open(latency_calib_dir.joinpath('alignment_window.json'), 'w') as fp:
+        json.dump(alignment_window, fp, indent=2)
+
+    # plot matched trajectories on pose timeline
+    aruco_for_plot = [(p[1], p[2]) for p in best_pairs]
+    arcap_for_plot = [(p[1], p[3]) for p in best_pairs]
+    plot_trajectories(
+        aruco_for_plot,
+        arcap_for_plot,
+        [],
+        [],
+        latency_calib_dir.joinpath('latency_trajectory_final_global_match.pdf')
+    )
 
 
     

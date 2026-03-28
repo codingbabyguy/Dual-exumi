@@ -22,7 +22,8 @@ from matplotlib.animation import FuncAnimation, FFMpegWriter, PillowWriter
 
 # ================= 可视化参数 =================
 # 🔧 修改这里以指定你的数据文件夹路径
-DATA_FOLDER = "/home/icrlab/tactile_work_Wy/data/simple-4.5/batch_3/pose"  # 写死的目标文件夹路径
+DATA_FOLDER = "/home/icrlab/tactile_work_Wy/data/simple-5.3/batch_2/pose" \
+""  # 写死的目标文件夹路径
 
 VIDEO_FPS = 30          # 视频帧率
 DOWNSAMPLE = 1          # 数据抽稀倍数（1=不抽稀，2=每两帧取一帧）
@@ -308,7 +309,16 @@ def save_static_image(pts, bounds, folder_path, use_absolute=False):
     print(f"   ✅ 静态图片已保存: {os.path.basename(output_path)}")
 
 
-def save_animated_video(pts, rotmats, bounds, folder_path, use_absolute=False, output_format="mp4"):
+def save_animated_video(
+    pts,
+    rotmats,
+    bounds,
+    folder_path,
+    use_absolute=False,
+    output_format="mp4",
+    video_fps=None,
+    output_basename=None,
+):
     """
     生成轨迹运动回放视频或 GIF
     
@@ -316,9 +326,10 @@ def save_animated_video(pts, rotmats, bounds, folder_path, use_absolute=False, o
         output_format: "mp4" 或 "gif"
     """
     coord_type = "absolute" if use_absolute else "relative"
-    base_name = f"trajectory_animation_{coord_type}"
+    base_name = output_basename if output_basename else f"trajectory_animation_{coord_type}"
     mp4_path = os.path.join(folder_path, f"{base_name}.mp4")
     gif_path = os.path.join(folder_path, f"{base_name}.gif")
+    render_fps = float(video_fps) if video_fps is not None else float(VIDEO_FPS)
 
     # 数据抽稀
     plot_pts = pts[::DOWNSAMPLE]
@@ -402,7 +413,7 @@ def save_animated_video(pts, rotmats, bounds, folder_path, use_absolute=False, o
         return head_dot, trace_line, time_text, info_text, *axis_artists
 
     # 创建动画对象
-    ani = FuncAnimation(fig, update, frames=num_frames, interval=1000/VIDEO_FPS, blit=False)
+    ani = FuncAnimation(fig, update, frames=num_frames, interval=1000 / render_fps, blit=False)
 
     def make_progress_callback(tag):
         def _cb(i, n):
@@ -421,7 +432,7 @@ def save_animated_video(pts, rotmats, bounds, folder_path, use_absolute=False, o
         try:
             from matplotlib.animation import FFMpegWriter
             print("         🎬 使用 FFmpeg 编码 MP4...")
-            writer = FFMpegWriter(fps=VIDEO_FPS, metadata=dict(artist='exUMI'), bitrate=2000)
+            writer = FFMpegWriter(fps=render_fps, metadata=dict(artist='exUMI'), bitrate=2000)
             ani.save(mp4_path, writer=writer, progress_callback=make_progress_callback("MP4"))
             print(f"   ✅ MP4 视频已保存: {os.path.basename(mp4_path)}")
             return mp4_path
