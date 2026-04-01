@@ -1,70 +1,72 @@
 #!/usr/bin/env python3
 """
-将 exUMI session 数据转换为 LeRobot Diffusion Policy 可直接训练的数据格式。
+Convert an exUMI session into a LeRobot v3 dataset with a single, explicit
+coordinate contract:
 
-转换目标
---------
-1) 输入整个 session 目录（包含 demos 和 tactile_*/angle_*.json）
-2) 使用每个 demo 的 raw_video.mp4 + aligned_arcap_poses.json
-3) 生成按帧索引的数据集，核心字段：
-   - observation.image
-   - action (10维: 3平移 + 6D旋转 + 1夹爪)
+- `aligned_arcap_poses.json` is assumed to already be expressed in the policy
+  manual frame.
+- `observation.state` and `action` are both stored as raw 10D manual-frame
+  vectors: [x, y, z, rot6d(6), gripper_norm].
+- Training/inference normalization is delegated to LeRobot's
+  `meta/stats.json` and processor pipeline.
 
-动作定义
---------
-- 平移 (x, y, z): 使用训练集全局 Z-score 标准化
-- 旋转 (qx, qy, qz, qw): 转换为 6D rotation 表示
-- 夹爪 (gripper): 来自 angle_*.json，归一化到 [0,1]
-
-严格对齐原则
-------------
-视频帧和控制序列使用同一时间轴，且逐帧构建：
-  t_i = t0 + i / fps
-
-其中：
-- t0 来自 mp4 timecode 解析（与现有 pipeline 保持一致）
-- i 为视频解码帧索引
-- 同一个 t_i 同时用于：取 observation.image、取 pose[i]、插值 gripper
-
-这样可以保证视频抽帧逻辑与位姿/夹爪重采样逻辑完全一致。
-
-示例
-----
-python scripts/convert_session_to_lerobot_dp.py \
-    --session_dir data/my_session/batch_1 \
-    --output_dir data/my_session/batch_1/lerobot_dp_dataset
+The script also writes visual diagnostics so each stage can be checked quickly.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import math
-import random
+import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, Iterator, List, Sequence, Tuple
+from typing import Iterable
 
 import av
+import cv2
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 
 try:
-    from datasets import Dataset, DatasetDict, Features, Image, Sequence as HFSequence, Value
-except ImportError as e:
-    raise ImportError(
-        "未检测到 huggingface datasets。请先安装: pip install datasets"
-    ) from e
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+except Exception:  # pragma: no cover - visualization is best effort
+    plt = None
+
+
+THIS_FILE = Path(__file__).resolve()
+DUAL_EXUMI_ROOT = THIS_FILE.parents[1]
+WORKSPACE_ROOT = THIS_FILE.parents[3]
+MY_LEROBOT_SRC = WORKSPACE_ROOT / "my_lerobot" / "src"
+
+for path in (DUAL_EXUMI_ROOT, MY_LEROBOT_SRC):
+    path_str = str(path)
+    if path_str not in sys.path:
+        sys.path.insert(0, path_str)
 
 from umi.common.timecode_util import mp4_get_start_datetime
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+
+ACTION_NAMES = [
+    "x",
+    "y",
+    "z",
+    "rot6d_0",
+    "rot6d_1",
+    "rot6d_2",
+    "rot6d_3",
+    "rot6d_4",
+    "rot6d_5",
+    "gripper",
+]
 
 
 @dataclass
 class EpisodeMeta:
-    """描述一个 demo episode 的元信息。"""
-
     episode_name: str
-    episode_index: int
     video_path: Path
     aligned_pose_path: Path
     start_timestamp: float
@@ -72,481 +74,439 @@ class EpisodeMeta:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="将 session 数据转换为 LeRobot DP 可训练的 Hugging Face datasets 格式"
-    )
+    parser = argparse.ArgumentParser(description="Convert one exUMI session into LeRobot v3 manual-frame data")
+    parser.add_argument("--session_dir", type=str, required=True, help="Session directory, e.g. data/foo/batch_1")
+    parser.add_argument("--output_dir", type=str, required=True, help="Output LeRobot v3 root directory")
     parser.add_argument(
-        "--session_dir",
+        "--repo_id",
         type=str,
-        required=True,
-        help="session 目录路径（例如 data/xxx/batch_1）",
+        default=None,
+        help="LeRobot repo_id written to metadata. Defaults to local/<output_dir_name>.",
     )
     parser.add_argument(
-        "--output_dir",
+        "--task",
         type=str,
-        required=True,
-        help="输出目录（将写入 hf_dataset 与统计信息）",
+        default=None,
+        help="Task string stored in dataset metadata. Defaults to the session folder name.",
     )
+    parser.add_argument("--robot_type", type=str, default="realman_manual_frame", help="robot_type metadata value")
+    parser.add_argument("--image_height", type=int, default=224, help="Processed image height")
+    parser.add_argument("--image_width", type=int, default=224, help="Processed image width")
     parser.add_argument(
-        "--train_ratio",
+        "--crop_ratio",
         type=float,
-        default=0.9,
-        help="按 episode 级别划分训练集比例，默认 0.9",
+        default=1.0,
+        help="Center crop ratio before resize. 1.0 keeps full frame.",
     )
     parser.add_argument(
-        "--seed",
+        "--report_samples",
         type=int,
-        default=42,
-        help="episode 划分随机种子",
-    )
-    parser.add_argument(
-        "--strict",
-        action="store_true",
-        default=True,
-        help="开启严格检查：视频解码帧数必须与 aligned pose 条目数一致（默认开启）",
+        default=6,
+        help="How many processed frames to keep for the montage report.",
     )
     return parser.parse_args()
 
 
-def _safe_angle_to_scalar(v) -> float:
-    """将 angle JSON 中可能是标量或长度为1的数组安全转换为 float。"""
-    if isinstance(v, (list, tuple, np.ndarray)):
-        if len(v) == 0:
-            raise ValueError("检测到空 angle 元素，无法转换为标量")
-        return float(v[0])
-    return float(v)
+def load_json(path: Path) -> dict:
+    with path.open("r", encoding="utf-8") as f:
+        return json.load(f)
 
 
-def load_angle_stream(session_dir: Path) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    读取整个 session 的 angle 数据流。
-
-    数据来源：session_dir/tactile_*/angle_*.json
-    每个文件结构：
-    {
-      "angles": [[...], [...], ...],
-      "data": [...],
-      "timestamps": [...]
-    }
-
-    返回：
-    - times: shape (N,), 绝对时间戳（秒）
-    - vals : shape (N,), 对应 angle 标量
-    """
-    angle_files = sorted(session_dir.glob("tactile_*/angle_*.json"))
-    if len(angle_files) == 0:
-        raise FileNotFoundError(
-            f"未在 {session_dir} 下找到 tactile_*/angle_*.json，无法构建 gripper 序列"
-        )
-
-    all_times: List[float] = []
-    all_vals: List[float] = []
-
-    for p in angle_files:
-        with p.open("r", encoding="utf-8") as f:
-            obj = json.load(f)
-        timestamps = obj.get("timestamps", [])
-        angles = obj.get("angles", [])
-        if len(timestamps) != len(angles):
-            raise ValueError(
-                f"angle 文件长度不一致: {p} | timestamps={len(timestamps)} angles={len(angles)}"
-            )
-        all_times.extend(float(x) for x in timestamps)
-        all_vals.extend(_safe_angle_to_scalar(a) for a in angles)
-
-    if len(all_times) == 0:
-        raise ValueError("angle 数据为空，无法进行 gripper 构建")
-
-    times = np.asarray(all_times, dtype=np.float64)
-    vals = np.asarray(all_vals, dtype=np.float64)
-
-    # 按时间排序，保证后续插值稳定。
-    order = np.argsort(times)
-    times = times[order]
-    vals = vals[order]
-
-    # 去除重复时间戳（保留最后一次观测）。
-    # np.unique 返回首个索引，因此我们先反转再取 unique 再还原。
-    rev_times = times[::-1]
-    rev_vals = vals[::-1]
-    uniq_rev_times, uniq_rev_idx = np.unique(rev_times, return_index=True)
-    uniq_times = uniq_rev_times[::-1]
-    uniq_vals = rev_vals[uniq_rev_idx][::-1]
-
-    if len(uniq_times) < 2:
-        raise ValueError("有效 angle 时间点少于2个，无法插值")
-    return uniq_times, uniq_vals
+def load_segment_start_timestamp(video_path: Path) -> float:
+    segment_meta_path = video_path.parent / "segment_meta.json"
+    if segment_meta_path.is_file():
+        return float(load_json(segment_meta_path)["start_timestamp"])
+    return float(mp4_get_start_datetime(str(video_path)).timestamp())
 
 
-def interpolate_angle(times_ref: np.ndarray, vals_ref: np.ndarray, query_ts: np.ndarray) -> np.ndarray:
-    """
-    在统一时间轴 query_ts 上插值 gripper angle。
-
-    这里使用 np.interp 做一维线性插值。
-    对于边界外的 query_ts，按边界值外推（left/right）。
-    """
-    return np.interp(query_ts, times_ref, vals_ref, left=vals_ref[0], right=vals_ref[-1])
-
-
-def discover_episodes(session_dir: Path) -> List[EpisodeMeta]:
-    """
-    发现 session 下所有可用 demo，并提取时间基准信息。
-
-    预期结构：
-    session_dir/
-      demos/
-        demo_xxx/
-          raw_video.mp4
-          aligned_arcap_poses.json
-    """
+def discover_episodes(session_dir: Path) -> list[EpisodeMeta]:
     demos_dir = session_dir / "demos"
     if not demos_dir.is_dir():
-        raise FileNotFoundError(f"未找到 demos 目录: {demos_dir}")
+        raise FileNotFoundError(f"Missing demos directory: {demos_dir}")
 
-    metas: List[EpisodeMeta] = []
-    demo_video_paths = sorted(demos_dir.glob("*/raw_video.mp4"))
-    if len(demo_video_paths) == 0:
-        raise FileNotFoundError(f"在 {demos_dir} 下未找到任何 raw_video.mp4")
-
-    for epi, video_path in enumerate(demo_video_paths):
-        aligned_path = video_path.parent / "aligned_arcap_poses.json"
-        if not aligned_path.is_file():
-            # 直接跳过，避免混入未对齐 demo。
+    metas: list[EpisodeMeta] = []
+    for video_path in sorted(demos_dir.glob("*/raw_video.mp4")):
+        aligned_pose_path = video_path.parent / "aligned_arcap_poses.json"
+        if not aligned_pose_path.is_file():
             continue
-
         with av.open(str(video_path), "r") as container:
             stream = container.streams.video[0]
             fps = float(stream.average_rate)
-
-        start_ts = mp4_get_start_datetime(str(video_path)).timestamp()
         metas.append(
             EpisodeMeta(
                 episode_name=video_path.parent.name,
-                episode_index=epi,
                 video_path=video_path,
-                aligned_pose_path=aligned_path,
-                start_timestamp=float(start_ts),
-                fps=float(fps),
+                aligned_pose_path=aligned_pose_path,
+                start_timestamp=load_segment_start_timestamp(video_path),
+                fps=fps,
             )
         )
-
-    if len(metas) == 0:
-        raise FileNotFoundError(
-            "没有可用 demo（可能缺少 aligned_arcap_poses.json，请先运行 AR_03_align_trajectory）"
-        )
+    if not metas:
+        raise FileNotFoundError("No aligned demos found. Please run AR_03 first.")
     return metas
 
 
-def split_episodes(metas: List[EpisodeMeta], train_ratio: float, seed: int) -> Tuple[List[EpisodeMeta], List[EpisodeMeta]]:
-    """按 episode 级别做 train/val 划分，避免同一轨迹泄漏到不同集合。"""
-    if not (0.0 < train_ratio < 1.0):
-        raise ValueError(f"train_ratio 必须在 (0,1) 之间，当前为 {train_ratio}")
-
-    order = list(range(len(metas)))
-    rng = random.Random(seed)
-    rng.shuffle(order)
-
-    # 至少保证 train 和 val 都非空（当 episode 数 >= 2 时）。
-    n_total = len(metas)
-    n_train = int(math.floor(n_total * train_ratio))
-    if n_total >= 2:
-        n_train = min(max(n_train, 1), n_total - 1)
-    else:
-        n_train = n_total
-
-    train_idx = set(order[:n_train])
-    train_eps = [m for i, m in enumerate(metas) if i in train_idx]
-    val_eps = [m for i, m in enumerate(metas) if i not in train_idx]
-    return train_eps, val_eps
-
-
-def load_pose_array(aligned_pose_path: Path) -> np.ndarray:
-    """
-    加载 aligned_arcap_poses.json 中的 pose 列表。
-
-    预期：obj["pose"] 是 N x 7 的数组，顺序为 [x,y,z,qx,qy,qz,qw]。
-    """
-    with aligned_pose_path.open("r", encoding="utf-8") as f:
-        obj = json.load(f)
-    pose = np.asarray(obj["pose"], dtype=np.float64)
+def load_aligned_episode(meta: EpisodeMeta) -> tuple[np.ndarray, np.ndarray]:
+    obj = load_json(meta.aligned_pose_path)
+    pose = np.asarray(obj.get("pose"), dtype=np.float64)
+    width = np.asarray(obj.get("width"), dtype=np.float64).reshape(-1)
     if pose.ndim != 2 or pose.shape[1] != 7:
+        raise ValueError(f"Invalid pose shape in {meta.aligned_pose_path}: {pose.shape}")
+    if len(width) != len(pose):
         raise ValueError(
-            f"pose 维度错误: {aligned_pose_path} | shape={pose.shape}，期望 (N,7)"
+            f"Pose/width length mismatch in {meta.aligned_pose_path}: pose={len(pose)} width={len(width)}"
         )
-    return pose
+    return pose, width
+
+
+def find_calibration_file(session_dir: Path) -> Path | None:
+    candidates = [
+        session_dir / "calibration_params.npz",
+        session_dir.parent / "calibration_params.npz",
+        session_dir.parent.parent / "calibration_params.npz",
+    ]
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def load_calibration(session_dir: Path) -> dict | None:
+    calib_path = find_calibration_file(session_dir)
+    if calib_path is None:
+        return None
+    with np.load(str(calib_path)) as obj:
+        return {
+            "path": str(calib_path),
+            "manual_origin": np.asarray(obj["manual_origin"], dtype=np.float64).tolist(),
+            "manual_rotation": np.asarray(obj["manual_rotation"], dtype=np.float64).tolist(),
+        }
+
+
+def ensure_empty_output_dir(path: Path) -> None:
+    if path.exists() and any(path.iterdir()):
+        raise FileExistsError(f"Output directory is not empty: {path}")
+    path.mkdir(parents=True, exist_ok=True)
 
 
 def quat_xyzw_to_rot6d(quat_xyzw: np.ndarray) -> np.ndarray:
-    """
-    将四元数 (x,y,z,w) 转成 6D rotation 表示。
-
-    实现方式：
-    1) 归一化四元数
-    2) 转旋转矩阵 R (3x3)
-    3) 取前两列并展平得到 6 维向量
-    """
-    q = np.asarray(quat_xyzw, dtype=np.float64)
-    n = np.linalg.norm(q)
-    if n < 1e-12:
-        raise ValueError("检测到接近零范数四元数，无法转换为旋转")
-    q = q / n
-    rot_m = R.from_quat(q).as_matrix()  # 3x3
-    rot6d = np.concatenate([rot_m[:, 0], rot_m[:, 1]], axis=0)
-    return rot6d.astype(np.float32)
+    quat_xyzw = np.asarray(quat_xyzw, dtype=np.float64)
+    norm = np.linalg.norm(quat_xyzw)
+    if norm < 1e-12:
+        raise ValueError("Encountered near-zero quaternion")
+    rot_m = R.from_quat(quat_xyzw / norm).as_matrix()
+    return np.concatenate([rot_m[:, 0], rot_m[:, 1]], axis=0).astype(np.float32)
 
 
-def build_frame_timestamps(start_ts: float, fps: float, n: int) -> np.ndarray:
-    """构建长度为 n 的逐帧绝对时间戳数组。"""
-    idx = np.arange(n, dtype=np.float64)
-    return start_ts + idx / fps
+def preprocess_rgb_frame(frame_rgb: np.ndarray, output_hw: tuple[int, int], crop_ratio: float) -> np.ndarray:
+    out_h, out_w = output_hw
+    frame = np.asarray(frame_rgb, dtype=np.uint8)
+    if frame.ndim != 3 or frame.shape[2] != 3:
+        raise ValueError(f"Expected RGB frame with shape (H,W,3), got {frame.shape}")
+
+    in_h, in_w = frame.shape[:2]
+    crop_ratio = float(crop_ratio)
+    if not (0.0 < crop_ratio <= 1.0):
+        raise ValueError(f"crop_ratio must be in (0,1], got {crop_ratio}")
+
+    if crop_ratio < 1.0:
+        target_ratio = out_w / float(out_h)
+        crop_h = max(1, min(int(round(in_h * crop_ratio)), in_h))
+        crop_w = max(1, min(int(round(crop_h * target_ratio)), in_w))
+        if crop_w > in_w:
+            crop_w = in_w
+            crop_h = max(1, min(int(round(crop_w / target_ratio)), in_h))
+        x0 = max((in_w - crop_w) // 2, 0)
+        y0 = max((in_h - crop_h) // 2, 0)
+        frame = frame[y0 : y0 + crop_h, x0 : x0 + crop_w]
+        interp = cv2.INTER_LINEAR if (crop_w < out_w or crop_h < out_h) else cv2.INTER_AREA
+        return cv2.resize(frame, (out_w, out_h), interpolation=interp)
+
+    scale = max(out_w / float(in_w), out_h / float(in_h))
+    resize_w = max(int(np.ceil(in_w * scale)), out_w)
+    resize_h = max(int(np.ceil(in_h * scale)), out_h)
+    interp = cv2.INTER_LINEAR if scale > 1.0 else cv2.INTER_AREA
+    frame = cv2.resize(frame, (resize_w, resize_h), interpolation=interp)
+    x0 = max((resize_w - out_w) // 2, 0)
+    y0 = max((resize_h - out_h) // 2, 0)
+    frame = frame[y0 : y0 + out_h, x0 : x0 + out_w]
+    if frame.shape[0] != out_h or frame.shape[1] != out_w:
+        frame = cv2.resize(frame, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
+    return frame.astype(np.uint8, copy=False)
 
 
-def compute_train_stats(
-    train_eps: Sequence[EpisodeMeta],
-    angle_times: np.ndarray,
-    angle_vals: np.ndarray,
-) -> Dict[str, List[float]]:
-    """
-    用训练集全局统计量计算标准化参数：
-    - 平移 xyz 的 mean/std
-    - gripper angle 的 min/max
-    """
-    xyz_sum = np.zeros(3, dtype=np.float64)
-    xyz_sq_sum = np.zeros(3, dtype=np.float64)
-    total_count = 0
-
-    g_min = np.inf
-    g_max = -np.inf
-
-    for ep in train_eps:
-        pose = load_pose_array(ep.aligned_pose_path)
-        n = pose.shape[0]
-        xyz = pose[:, :3]
-
-        xyz_sum += xyz.sum(axis=0)
-        xyz_sq_sum += np.square(xyz).sum(axis=0)
-        total_count += n
-
-        ts = build_frame_timestamps(ep.start_timestamp, ep.fps, n)
-        g = interpolate_angle(angle_times, angle_vals, ts)
-        g_min = min(g_min, float(np.min(g)))
-        g_max = max(g_max, float(np.max(g)))
-
-    if total_count == 0:
-        raise ValueError("训练集为空，无法计算标准化参数")
-
-    mean = xyz_sum / total_count
-    var = xyz_sq_sum / total_count - np.square(mean)
-    var = np.maximum(var, 1e-12)
-    std = np.sqrt(var)
-
-    # 若 gripper 全程恒定，避免除0。
-    if not np.isfinite(g_min) or not np.isfinite(g_max):
-        raise ValueError("未能从训练集计算 gripper min/max")
-    if abs(g_max - g_min) < 1e-12:
-        g_max = g_min + 1.0
-
+def build_dataset_features(image_hw: tuple[int, int]) -> dict:
+    image_h, image_w = image_hw
     return {
-        "xyz_mean": mean.tolist(),
-        "xyz_std": std.tolist(),
-        "gripper_min": [float(g_min)],
-        "gripper_max": [float(g_max)],
+        "observation.image": {
+            "dtype": "image",
+            "shape": (image_h, image_w, 3),
+            "names": ["height", "width", "channel"],
+        },
+        "observation.state": {
+            "dtype": "float32",
+            "shape": (10,),
+            "names": ACTION_NAMES,
+        },
+        "action": {
+            "dtype": "float32",
+            "shape": (10,),
+            "names": ACTION_NAMES,
+        },
     }
 
 
-def normalize_xyz(xyz: np.ndarray, mean: np.ndarray, std: np.ndarray) -> np.ndarray:
-    """对 xyz 进行 Z-score 标准化。"""
-    return (xyz - mean) / std
+def flatten_stats_range(stats: dict, key: str) -> tuple[list[float], list[float]]:
+    min_vals = np.asarray(stats[key]["min"], dtype=np.float64).reshape(-1)
+    max_vals = np.asarray(stats[key]["max"], dtype=np.float64).reshape(-1)
+    return min_vals.tolist(), max_vals.tolist()
 
 
-def normalize_gripper(v: np.ndarray, g_min: float, g_max: float) -> np.ndarray:
-    """将 gripper angle 线性归一化到 [0,1]，并做 clip。"""
-    out = (v - g_min) / (g_max - g_min)
-    return np.clip(out, 0.0, 1.0)
+def save_state_action_plot(report_dir: Path, episode_name: str, states: np.ndarray, actions: np.ndarray) -> None:
+    if plt is None or len(states) == 0:
+        return
+    t = np.arange(len(states), dtype=np.float64)
+    fig, axes = plt.subplots(5, 2, figsize=(16, 14), sharex=True)
+    axes = axes.flatten()
+    for idx, name in enumerate(ACTION_NAMES):
+        ax = axes[idx]
+        ax.plot(t, states[:, idx], label="state", linewidth=1.5)
+        ax.plot(t, actions[:, idx], label="action", linewidth=1.1, alpha=0.85)
+        ax.set_title(name)
+        ax.grid(alpha=0.25)
+    axes[0].legend(loc="upper right")
+    axes[-1].set_xlabel("frame")
+    fig.suptitle(f"Episode {episode_name}: observation.state vs action", fontsize=14)
+    fig.tight_layout()
+    fig.savefig(report_dir / "episode_000_state_action.png", dpi=160)
+    plt.close(fig)
 
 
-def iter_episode_samples(
-    ep: EpisodeMeta,
-    angle_times: np.ndarray,
-    angle_vals: np.ndarray,
-    xyz_mean: np.ndarray,
-    xyz_std: np.ndarray,
-    g_min: float,
-    g_max: float,
-    strict: bool,
-) -> Iterator[Dict]:
-    """
-    逐帧迭代一个 episode 的样本。
+def save_frame_montage(report_dir: Path, frames: Iterable[np.ndarray]) -> None:
+    if plt is None:
+        return
+    frames = list(frames)
+    if not frames:
+        return
+    cols = min(3, len(frames))
+    rows = int(np.ceil(len(frames) / float(cols)))
+    fig, axes = plt.subplots(rows, cols, figsize=(4 * cols, 4 * rows))
+    axes_arr = np.atleast_1d(axes).reshape(-1)
+    for ax, frame_idx in zip(axes_arr, range(len(frames)), strict=False):
+        ax.imshow(frames[frame_idx])
+        ax.set_title(f"processed frame {frame_idx}")
+        ax.axis("off")
+    for ax in axes_arr[len(frames) :]:
+        ax.axis("off")
+    fig.tight_layout()
+    fig.savefig(report_dir / "episode_000_frames.png", dpi=160)
+    plt.close(fig)
 
-    说明：
-    - 该函数是“严格一致性”的核心：
-      每解码一帧，立刻在同一帧索引 i 上构建 action。
-    - 不先整段缓存，避免中间处理改变帧计数。
-    """
-    pose = load_pose_array(ep.aligned_pose_path)
-    n_pose = pose.shape[0]
 
-    # 先构建这一条 episode 的 gripper 时间序列，长度与 pose 对齐。
-    ts_arr = build_frame_timestamps(ep.start_timestamp, ep.fps, n_pose)
-    g_raw = interpolate_angle(angle_times, angle_vals, ts_arr)
-    g_norm = normalize_gripper(g_raw, g_min, g_max)
-
-    decoded = 0
-    with av.open(str(ep.video_path), "r") as container:
-        stream = container.streams.video[0]
-        stream.thread_type = "AUTO"
-
-        for i, frame in enumerate(container.decode(stream)):
-            decoded += 1
-            if i >= n_pose:
-                if strict:
-                    raise ValueError(
-                        f"视频帧数多于 pose 条目: {ep.episode_name} | decoded>{n_pose}"
-                    )
-                break
-
-            img = frame.to_ndarray(format="rgb24")
-
-            xyz = pose[i, :3]
-            quat = pose[i, 3:7]
-            xyz_n = normalize_xyz(xyz, xyz_mean, xyz_std).astype(np.float32)
-            rot6d = quat_xyzw_to_rot6d(quat)
-            grip = np.array([g_norm[i]], dtype=np.float32)
-
-            action = np.concatenate([xyz_n, rot6d, grip], axis=0)
-            if action.shape[0] != 10:
-                raise RuntimeError(
-                    f"动作维度错误: {action.shape[0]}，期望 10 (3+6+1)"
-                )
-
-            yield {
-                "observation.image": img,
-                "action": action.tolist(),
-                "episode_index": int(ep.episode_index),
-                "frame_index": int(i),
-                "timestamp": float(ts_arr[i]),
+def build_deployment_template(
+    output_dir: Path,
+    repo_id: str,
+    calibration: dict | None,
+    stats: dict,
+    image_shape: tuple[int, int, int],
+) -> dict:
+    action_min, action_max = flatten_stats_range(stats, "action")
+    state_min, state_max = flatten_stats_range(stats, "observation.state")
+    return {
+        "coordinate_frame": "manual_relative_frame",
+        "dataset": {
+            "repo_id": repo_id,
+            "root": str(output_dir),
+            "meta_info_path": str(output_dir / "meta" / "info.json"),
+            "meta_stats_path": str(output_dir / "meta" / "stats.json"),
+        },
+        "action_schema": {
+            "names": ACTION_NAMES,
+            "coordinate_frame": "manual_relative_frame",
+            "position_unit": "meter",
+            "rotation_representation": "rot6d",
+            "gripper_unit": "normalized",
+        },
+        "safety": {
+            "action_bounds": {
+                name: [float(action_min[i]), float(action_max[i])] for i, name in enumerate(ACTION_NAMES)
+            },
+            "workspace_bounds": {
+                axis: [float(state_min[i]), float(state_max[i])]
+                for i, axis in enumerate(["x", "y", "z"])
+            },
+        },
+        "robot_adapter": {
+            "config": {
+                "policy_frame": "manual_relative_frame",
+                "manual_origin": calibration["manual_origin"] if calibration else None,
+                "manual_rotation": calibration["manual_rotation"] if calibration else None,
+                "image_shape": list(image_shape),
+                "use_sdk_pose_transform": True,
+                "lock_work_tool_frame": True,
+                "expected_work_frame_names": [],
+                "expected_tool_frame_names": [],
+                "workspace_clip_in_adapter": False,
             }
-
-    if strict and decoded != n_pose:
-        raise ValueError(
-            f"视频帧数与 pose 条目不一致: {ep.episode_name} | decoded={decoded}, pose={n_pose}"
-        )
-
-
-def build_split_dataset(
-    episodes: Sequence[EpisodeMeta],
-    angle_times: np.ndarray,
-    angle_vals: np.ndarray,
-    stats: Dict[str, List[float]],
-    strict: bool,
-) -> Dataset:
-    """
-    构建单个 split 的 HF Dataset。
-
-    这里使用 from_generator，避免一次性将所有帧加载到内存。
-    """
-    xyz_mean = np.asarray(stats["xyz_mean"], dtype=np.float64)
-    xyz_std = np.asarray(stats["xyz_std"], dtype=np.float64)
-    g_min = float(stats["gripper_min"][0])
-    g_max = float(stats["gripper_max"][0])
-
-    def gen() -> Iterator[Dict]:
-        for ep in episodes:
-            for sample in iter_episode_samples(
-                ep=ep,
-                angle_times=angle_times,
-                angle_vals=angle_vals,
-                xyz_mean=xyz_mean,
-                xyz_std=xyz_std,
-                g_min=g_min,
-                g_max=g_max,
-                strict=strict,
-            ):
-                yield sample
-
-    features = Features(
-        {
-            "observation.image": Image(),
-            "action": HFSequence(feature=Value("float32"), length=10),
-            "episode_index": Value("int32"),
-            "frame_index": Value("int32"),
-            "timestamp": Value("float64"),
-        }
-    )
-    return Dataset.from_generator(gen, features=features)
+        },
+        "calibration": calibration,
+    }
 
 
 def main() -> None:
     args = parse_args()
-
     session_dir = Path(args.session_dir).expanduser().resolve()
     output_dir = Path(args.output_dir).expanduser().resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
+    repo_id = args.repo_id or f"local/{output_dir.name}"
+    task_name = args.task or session_dir.name
+    image_hw = (int(args.image_height), int(args.image_width))
+    ensure_empty_output_dir(output_dir)
 
-    print(f"[INFO] Session: {session_dir}")
-    print(f"[INFO] Output : {output_dir}")
+    print(f"[INFO] session_dir={session_dir}")
+    print(f"[INFO] output_dir ={output_dir}")
+    print(f"[INFO] repo_id    ={repo_id}")
+    print(f"[INFO] task       ={task_name}")
 
-    # 步骤1: 发现可用 episode
     episodes = discover_episodes(session_dir)
-    print(f"[INFO] Found episodes: {len(episodes)}")
+    common_fps = episodes[0].fps
+    for ep in episodes[1:]:
+        if abs(ep.fps - common_fps) > 1e-6:
+            raise ValueError(f"Inconsistent fps across episodes: {episodes[0].fps} vs {ep.fps} ({ep.episode_name})")
 
-    # 步骤2: 读取 angle 全局流，用于构建 gripper 维度
-    angle_times, angle_vals = load_angle_stream(session_dir)
-    print(
-        "[INFO] Angle stream loaded: "
-        f"N={len(angle_times)}, range=[{angle_times[0]:.6f}, {angle_times[-1]:.6f}]"
+    width_values: list[np.ndarray] = []
+    pose_cache: dict[str, np.ndarray] = {}
+    width_cache: dict[str, np.ndarray] = {}
+    for ep in episodes:
+        pose_arr, width_arr = load_aligned_episode(ep)
+        pose_cache[ep.episode_name] = pose_arr
+        width_cache[ep.episode_name] = width_arr
+        width_values.append(width_arr)
+    all_width = np.concatenate(width_values, axis=0)
+    width_min = float(np.min(all_width))
+    width_max = float(np.max(all_width))
+    if abs(width_max - width_min) < 1e-12:
+        width_max = width_min + 1.0
+
+    dataset = LeRobotDataset.create(
+        repo_id=repo_id,
+        fps=int(round(common_fps)),
+        features=build_dataset_features(image_hw),
+        root=output_dir,
+        robot_type=args.robot_type,
+        use_videos=False,
     )
 
-    # 步骤3: episode 级别划分 train/validation
-    train_eps, val_eps = split_episodes(episodes, train_ratio=args.train_ratio, seed=args.seed)
-    print(f"[INFO] Train episodes: {len(train_eps)} | Val episodes: {len(val_eps)}")
+    debug_frames: list[np.ndarray] = []
+    first_episode_states: list[np.ndarray] = []
+    first_episode_actions: list[np.ndarray] = []
+    total_frames = 0
 
-    # 步骤4: 只用训练集计算标准化参数
-    stats = compute_train_stats(train_eps, angle_times, angle_vals)
-    print("[INFO] Normalization stats:")
-    print(f"       xyz_mean={stats['xyz_mean']}")
-    print(f"       xyz_std ={stats['xyz_std']}")
-    print(f"       g_min   ={stats['gripper_min'][0]:.6f}")
-    print(f"       g_max   ={stats['gripper_max'][0]:.6f}")
+    for episode_index, ep in enumerate(episodes):
+        pose_arr = pose_cache[ep.episode_name]
+        width_arr = width_cache[ep.episode_name]
+        decoded_frames = 0
+        print(f"[EP {episode_index:03d}] {ep.episode_name} | frames={len(pose_arr)} | fps={ep.fps:.6f}")
 
-    # 步骤5: 构建 HF datasets（按帧索引，严格对齐）
-    train_ds = build_split_dataset(
-        episodes=train_eps,
-        angle_times=angle_times,
-        angle_vals=angle_vals,
-        stats=stats,
-        strict=args.strict,
-    )
-    val_ds = build_split_dataset(
-        episodes=val_eps,
-        angle_times=angle_times,
-        angle_vals=angle_vals,
-        stats=stats,
-        strict=args.strict,
-    )
+        with av.open(str(ep.video_path), "r") as container:
+            stream = container.streams.video[0]
+            stream.thread_type = "AUTO"
+            for frame_idx, frame in enumerate(container.decode(stream)):
+                decoded_frames += 1
+                if frame_idx >= len(pose_arr):
+                    raise ValueError(f"Video has more frames than aligned poses: {ep.video_path}")
 
-    ds_dict = DatasetDict({"train": train_ds, "validation": val_ds})
+                img_rgb = frame.to_ndarray(format="rgb24")
+                img_proc = preprocess_rgb_frame(img_rgb, image_hw, crop_ratio=args.crop_ratio)
 
-    # 步骤6: 保存结果
-    hf_dir = output_dir / "hf_dataset"
-    ds_dict.save_to_disk(str(hf_dir))
+                pose = pose_arr[frame_idx]
+                xyz = pose[:3].astype(np.float32)
+                quat = pose[3:7]
+                rot6d = quat_xyzw_to_rot6d(quat)
+                grip = np.array([(width_arr[frame_idx] - width_min) / (width_max - width_min)], dtype=np.float32)
+                grip = np.clip(grip, 0.0, 1.0)
 
-    stats_path = output_dir / "normalization_stats.json"
-    with stats_path.open("w", encoding="utf-8") as f:
-        json.dump(stats, f, indent=2, ensure_ascii=False)
+                state = np.concatenate([xyz, rot6d, grip], axis=0).astype(np.float32)
+                action = state.copy()
+                timestamp = ep.start_timestamp + frame_idx / ep.fps
 
-    split_meta = {
-        "train_episodes": [ep.episode_name for ep in train_eps],
-        "validation_episodes": [ep.episode_name for ep in val_eps],
+                dataset.add_frame(
+                    {
+                        "observation.image": img_proc,
+                        "observation.state": state,
+                        "action": action,
+                        "task": task_name,
+                        "timestamp": float(timestamp),
+                    }
+                )
+
+                if episode_index == 0:
+                    first_episode_states.append(state.copy())
+                    first_episode_actions.append(action.copy())
+                    if len(debug_frames) < int(args.report_samples):
+                        debug_frames.append(img_proc.copy())
+
+        if decoded_frames != len(pose_arr):
+            raise ValueError(
+                f"Video/pose length mismatch in {ep.video_path.parent}: decoded={decoded_frames}, pose={len(pose_arr)}"
+            )
+
+        dataset.save_episode()
+        total_frames += len(pose_arr)
+
+    dataset.finalize()
+
+    info_path = output_dir / "meta" / "info.json"
+    stats_path = output_dir / "meta" / "stats.json"
+    info = load_json(info_path)
+    stats = load_json(stats_path)
+    calibration = load_calibration(session_dir)
+
+    report_dir = output_dir / "reports"
+    report_dir.mkdir(parents=True, exist_ok=True)
+
+    if first_episode_states:
+        save_state_action_plot(
+            report_dir,
+            episode_name=episodes[0].episode_name,
+            states=np.stack(first_episode_states, axis=0),
+            actions=np.stack(first_episode_actions, axis=0),
+        )
+    save_frame_montage(report_dir, debug_frames)
+
+    summary = {
+        "repo_id": repo_id,
+        "coordinate_frame": "manual_relative_frame",
         "session_dir": str(session_dir),
+        "output_dir": str(output_dir),
+        "task": task_name,
+        "total_episodes": len(episodes),
+        "total_frames": int(total_frames),
+        "fps": float(common_fps),
+        "image_shape": [int(args.image_height), int(args.image_width), 3],
+        "gripper_width_raw_min": width_min,
+        "gripper_width_raw_max": width_max,
+        "calibration": calibration,
     }
-    split_path = output_dir / "split_meta.json"
-    with split_path.open("w", encoding="utf-8") as f:
-        json.dump(split_meta, f, indent=2, ensure_ascii=False)
+    with (report_dir / "conversion_summary.json").open("w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2, ensure_ascii=False)
 
-    print(f"[DONE] HF dataset saved to: {hf_dir}")
-    print(f"[DONE] Stats saved to     : {stats_path}")
-    print(f"[DONE] Split meta saved to: {split_path}")
+    deployment_template = build_deployment_template(
+        output_dir=output_dir,
+        repo_id=repo_id,
+        calibration=calibration,
+        stats=stats,
+        image_shape=(int(args.image_height), int(args.image_width), 3),
+    )
+    with (report_dir / "deployment_manual_frame_template.json").open("w", encoding="utf-8") as f:
+        json.dump(deployment_template, f, indent=2, ensure_ascii=False)
+
+    print(f"[DONE] dataset root : {output_dir}")
+    print(f"[DONE] info.json    : {info_path}")
+    print(f"[DONE] stats.json   : {stats_path}")
+    print(f"[DONE] report dir   : {report_dir}")
+    print(f"[DONE] image shape  : {info['features']['observation.image']['shape']}")
+    print(f"[DONE] state shape  : {info['features']['observation.state']['shape']}")
+    print(f"[DONE] action shape : {info['features']['action']['shape']}")
 
 
 if __name__ == "__main__":

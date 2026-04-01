@@ -4,7 +4,7 @@ Main script for exUMI data process pipeline.
 流程概述：
   AR_00: 处理原始视频
   AR_01: 时间延迟校准（不生成PDF，仅输出latency_of_arcap.json）
-  AR_03: 多模态数据对齐（删除坐标变换，直接保存原始pose）
+  AR_03: 多模态数据对齐（默认保持采集端 manual frame 相对pose，仅时间对齐）
   AR_06: 生成数据集计划
   AR_08: 生成预览视频（使用改进的相对坐标系位姿可视化）
 
@@ -83,7 +83,27 @@ def confirm_after_alignment(session: pathlib.Path):
 @click.option('--init_offset', type=float, default=0)
 @click.option('--only_calib', is_flag=True, default=False, help="only run calibration")
 @click.option('--skip_calib', is_flag=True, default=False, help="skip the calibration")
-def main(session_dir, calibration_dir, gripper_threshold, calibration_axis, init_offset, only_calib, skip_calib):
+@click.option(
+    '--legacy_flexiv_transform/--no-legacy_flexiv_transform',
+    default=False,
+    help="AR_03 是否启用历史 Flexiv 固定外参。默认关闭，保持 manual frame 相对位姿。",
+)
+@click.option(
+    '--save_pose_debug/--no-save_pose_debug',
+    default=True,
+    help="AR_03 输出 aligned_pose_summary.json + aligned_pose_debug.png。",
+)
+def main(
+    session_dir,
+    calibration_dir,
+    gripper_threshold,
+    calibration_axis,
+    init_offset,
+    only_calib,
+    skip_calib,
+    legacy_flexiv_transform,
+    save_pose_debug,
+):
     script_dir = pathlib.Path(__file__).parent.joinpath('scripts_slam_pipeline')
     if calibration_dir is None:
         calibration_dir = pathlib.Path(__file__).parent.joinpath('example', 'calibration')
@@ -151,6 +171,12 @@ def main(session_dir, calibration_dir, gripper_threshold, calibration_axis, init
             '-calib', str(latency_json_path),
             '-tactile_calib', 'ARCap/tactile_calib/shape_config.yaml',
         ]
+        if legacy_flexiv_transform:
+            cmd.append('--legacy_flexiv_transform')
+        if save_pose_debug:
+            cmd.append('--save_pose_debug')
+        else:
+            cmd.append('--no-save_pose_debug')
         result = run_step("AR_03_align_trajectory", cmd)
         assert result.returncode == 0
 

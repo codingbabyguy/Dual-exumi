@@ -24,16 +24,37 @@ import subprocess
 @click.option('--init_offset', type=float, default=0)
 @click.option('--only_calib', is_flag=True, default=False, help="only run calibration")
 @click.option('--skip_calib', is_flag=True, default=False, help="skip the calibration")
-def main(session_dir, calibration_dir, gripper_threshold, calibration_axis, init_offset, only_calib, skip_calib):
-    script_dir = pathlib.Path(__file__).parent.joinpath('scripts_slam_pipeline')
+@click.option(
+    '--legacy_flexiv_transform/--no-legacy_flexiv_transform',
+    default=False,
+    help="AR_03 是否启用历史 Flexiv 固定外参。默认关闭，保持 manual frame 相对位姿。",
+)
+@click.option(
+    '--save_pose_debug/--no-save_pose_debug',
+    default=True,
+    help="AR_03 输出 aligned_pose_summary.json + aligned_pose_debug.png。",
+)
+def main(
+    session_dir,
+    calibration_dir,
+    gripper_threshold,
+    calibration_axis,
+    init_offset,
+    only_calib,
+    skip_calib,
+    legacy_flexiv_transform,
+    save_pose_debug,
+):
+    root_dir = pathlib.Path(ROOT_DIR)
+    script_dir = root_dir.joinpath('scripts_slam_pipeline')
     if calibration_dir is None:
-        calibration_dir = pathlib.Path(__file__).parent.joinpath('example', 'calibration')
+        calibration_dir = root_dir.joinpath('example', 'calibration')
     else:
         calibration_dir = pathlib.Path(calibration_dir)
     assert calibration_dir.is_dir()
 
     for session in session_dir:
-        session = pathlib.Path(__file__).parent.joinpath(session).absolute()
+        session = root_dir.joinpath(session).absolute()
 
         print("############## AR_00_process_videos #############")
         script_path = script_dir.joinpath("AR_00_process_videos.py")
@@ -75,6 +96,12 @@ def main(session_dir, calibration_dir, gripper_threshold, calibration_axis, init
             '-calib', str(session.joinpath('latency_calibration/latency_of_arcap.json')),
             '-tactile_calib', 'ARCap/tactile_calib/shape_config.yaml',
         ]
+        if legacy_flexiv_transform:
+            cmd.append('--legacy_flexiv_transform')
+        if save_pose_debug:
+            cmd.append('--save_pose_debug')
+        else:
+            cmd.append('--no-save_pose_debug')
         result = subprocess.run(cmd)
         assert result.returncode == 0
 

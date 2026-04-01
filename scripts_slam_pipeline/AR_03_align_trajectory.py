@@ -37,6 +37,13 @@ import copy
 import av
 from scipy.spatial.transform import Rotation as R
 import yaml
+try:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+except Exception:  # pragma: no cover - visualization is best effort
+    plt = None
 
 # 工具函数：提取视频起始时间戳
 from umi.common.timecode_util import mp4_get_start_datetime
@@ -70,6 +77,105 @@ def is_calibration_demo(video_dir: pathlib.Path):
     return bool(meta.get('is_calibration', False))
 
 
+def pose_to_matrix(pose: np.ndarray) -> np.ndarray:
+    mat = np.eye(4, dtype=np.float64)
+    mat[:3, 3] = pose[:3]
+    mat[:3, :3] = R.from_quat(pose[3:]).as_matrix()
+    return mat
+
+
+def apply_legacy_flexiv_transform(pose: np.ndarray) -> np.ndarray:
+    """Compatibility path for old Flexiv-oriented pipelines."""
+    mat = pose_to_matrix(pose)
+    tx_obj = mat @ tx_arhand_inv
+    mat = tx_arbase_at_flexivbase @ tx_obj @ tx_flexivobj_at_arobj @ tx_flexivcamera_at_flexivobj
+    out = np.asarray(pose, dtype=np.float64).copy()
+    out[:3] = mat[:3, 3]
+    out[3:] = R.from_matrix(mat[:3, :3]).as_quat()
+    return out
+
+
+def summarize_pose_series(poses: np.ndarray, widths: np.ndarray, fps: float) -> dict:
+    xyz = poses[:, :3]
+    quat = poses[:, 3:7]
+    xyz_step = np.linalg.norm(np.diff(xyz, axis=0), axis=1) if len(xyz) > 1 else np.zeros((0,), dtype=np.float64)
+    if len(quat) > 1:
+        rel = R.from_quat(quat[:-1]).inv() * R.from_quat(quat[1:])
+        rot_step_deg = np.degrees(np.linalg.norm(rel.as_rotvec(), axis=1))
+    else:
+        rot_step_deg = np.zeros((0,), dtype=np.float64)
+
+    return {
+        "frame_count": int(len(poses)),
+        "duration_sec": float((len(poses) - 1) / float(fps)) if len(poses) > 1 else 0.0,
+        "fps": float(fps),
+        "xyz_min": xyz.min(axis=0).tolist(),
+        "xyz_max": xyz.max(axis=0).tolist(),
+        "xyz_start": xyz[0].tolist(),
+        "xyz_end": xyz[-1].tolist(),
+        "quat_start": quat[0].tolist(),
+        "quat_end": quat[-1].tolist(),
+        "width_min": float(np.min(widths)),
+        "width_max": float(np.max(widths)),
+        "xyz_step_max_m": float(np.max(xyz_step)) if len(xyz_step) else 0.0,
+        "xyz_step_mean_m": float(np.mean(xyz_step)) if len(xyz_step) else 0.0,
+        "rot_step_max_deg": float(np.max(rot_step_deg)) if len(rot_step_deg) else 0.0,
+        "rot_step_mean_deg": float(np.mean(rot_step_deg)) if len(rot_step_deg) else 0.0,
+    }
+
+
+def save_pose_debug_plot(video_dir: pathlib.Path, poses: np.ndarray, widths: np.ndarray, fps: float) -> None:
+    if plt is None:
+        print("[WARN] matplotlib unavailable, skip aligned_pose_debug.png")
+        return
+
+    t = np.arange(len(poses), dtype=np.float64) / float(fps)
+    xyz = poses[:, :3]
+    quat = poses[:, 3:7]
+    xyz_step = np.linalg.norm(np.diff(xyz, axis=0), axis=1) if len(xyz) > 1 else np.zeros((0,), dtype=np.float64)
+    if len(quat) > 1:
+        rel = R.from_quat(quat[:-1]).inv() * R.from_quat(quat[1:])
+        rot_step_deg = np.degrees(np.linalg.norm(rel.as_rotvec(), axis=1))
+    else:
+        rot_step_deg = np.zeros((0,), dtype=np.float64)
+
+    fig = plt.figure(figsize=(14, 12))
+    ax_xyz = fig.add_subplot(4, 1, 1)
+    for i, axis_name in enumerate(["x", "y", "z"]):
+        ax_xyz.plot(t, xyz[:, i], label=axis_name, linewidth=1.4)
+    ax_xyz.set_title("Aligned Pose In Policy Manual Frame: XYZ")
+    ax_xyz.set_ylabel("meter")
+    ax_xyz.legend(loc="upper right")
+    ax_xyz.grid(alpha=0.25)
+
+    ax_quat = fig.add_subplot(4, 1, 2, sharex=ax_xyz)
+    for i, axis_name in enumerate(["qx", "qy", "qz", "qw"]):
+        ax_quat.plot(t, quat[:, i], label=axis_name, linewidth=1.2)
+    ax_quat.set_title("Quaternion")
+    ax_quat.legend(loc="upper right")
+    ax_quat.grid(alpha=0.25)
+
+    ax_width = fig.add_subplot(4, 1, 3, sharex=ax_xyz)
+    ax_width.plot(t, widths, color="tab:orange", linewidth=1.2)
+    ax_width.set_title("Aligned Gripper Width")
+    ax_width.set_ylabel("width")
+    ax_width.grid(alpha=0.25)
+
+    ax_step = fig.add_subplot(4, 1, 4, sharex=ax_xyz)
+    if len(xyz_step):
+        ax_step.plot(t[1:], xyz_step, label="xyz_step_m", linewidth=1.2)
+    if len(rot_step_deg):
+        ax_step.plot(t[1:], rot_step_deg, label="rot_step_deg", linewidth=1.2)
+    ax_step.set_title("Per-Frame Step Size")
+    ax_step.set_xlabel("time (s)")
+    ax_step.grid(alpha=0.25)
+    ax_step.legend(loc="upper right")
+
+    fig.tight_layout()
+    fig.savefig(video_dir.joinpath("aligned_pose_debug.png"), dpi=160)
+    plt.close(fig)
+
+
 
 
 # %%
@@ -78,7 +184,25 @@ def is_calibration_demo(video_dir: pathlib.Path):
 @click.option('-calib', '--arcap_latency_calibration_path', required=True, help='ARCap时延校准参数路径')
 @click.option('-tactile_calib', '--tactile_calibration_path', required=True, help='触觉标定参数路径')
 @click.option('-n', '--num_workers', type=int, default=8, help='并行处理线程数')
-def main(input_dir, arcap_latency_calibration_path, tactile_calibration_path, num_workers):
+@click.option(
+    '--legacy_flexiv_transform',
+    is_flag=True,
+    default=False,
+    help='兼容旧 Flexiv 坐标链路时启用固定外参。默认关闭，保持 manual frame 相对位姿语义。',
+)
+@click.option(
+    '--save_pose_debug/--no-save_pose_debug',
+    default=True,
+    help='为每个 demo 保存 aligned_pose_debug.png 和 aligned_pose_summary.json。',
+)
+def main(
+    input_dir,
+    arcap_latency_calibration_path,
+    tactile_calibration_path,
+    num_workers,
+    legacy_flexiv_transform,
+    save_pose_debug,
+):
     """
     主处理流程：
     1. 加载校准参数
@@ -156,17 +280,12 @@ def main(input_dir, arcap_latency_calibration_path, tactile_calibration_path, nu
                 drop_demo = True
                 break
 
-            # 姿态数据后处理：坐标变换到flexivbase
-            _pose = np.array(_pose)
-            assert _pose.shape == (7,), f"Invalid pose shape: {_pose.shape}, expected (6,)"
-            mat = np.identity(4)
-            mat[:3, 3] = _pose[:3]
-            mat[:3, :3] = R.from_quat(_pose[3:]).as_matrix()
-            # 坐标变换链：arhand->arbase->flexivbase->obj->camera
-            tx_obj = mat @ tx_arhand_inv
-            mat = tx_arbase_at_flexivbase @ tx_obj @ tx_flexivobj_at_arobj @ tx_flexivcamera_at_flexivobj
-            _pose[:3] = mat[:3, 3]
-            _pose[3:] = R.from_matrix(mat[:3, :3]).as_quat()
+            # 默认只做时间对齐，不再改空间语义：
+            # 采集端保存的是 manual frame 下的相对位姿，AR_03 应保持该语义不变。
+            _pose = np.array(_pose, dtype=np.float64)
+            assert _pose.shape == (7,), f"Invalid pose shape: {_pose.shape}, expected (7,)"
+            if legacy_flexiv_transform:
+                _pose = apply_legacy_flexiv_transform(_pose)
 
             aligned_proprio_data.append( {
                 'pose': _pose.tolist(),
@@ -207,6 +326,17 @@ def main(input_dir, arcap_latency_calibration_path, tactile_calibration_path, nu
         with open(video_dir.joinpath('aligned_arcap_poses.json'), 'w') as fp:
             proprio_data = listOfDict_to_dictOfList(aligned_proprio_data)
             json.dump(proprio_data, fp)
+
+        if save_pose_debug:
+            pose_arr = np.asarray(proprio_data["pose"], dtype=np.float64)
+            width_arr = np.asarray(proprio_data["width"], dtype=np.float64)
+            summary = summarize_pose_series(pose_arr, width_arr, float(fps))
+            summary["coordinate_frame"] = (
+                "legacy_flexiv_frame" if legacy_flexiv_transform else "manual_relative_frame"
+            )
+            with open(video_dir.joinpath('aligned_pose_summary.json'), 'w') as fp:
+                json.dump(summary, fp, indent=2)
+            save_pose_debug_plot(video_dir, pose_arr, width_arr, float(fps))
 
         # 保存对齐后的触觉数据为mp4
         tactile_data = listOfDict_to_dictOfList(aligned_tactile_data)
