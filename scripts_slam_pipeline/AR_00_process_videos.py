@@ -53,14 +53,101 @@ def _sanitize_marks(raw_marks):
     return sorted(set(out))
 
 
-def _load_capture_marks(session_path: pathlib.Path):
+def _sanitize_intervals(raw_intervals):
+    if not isinstance(raw_intervals, list):
+        return []
+    out = []
+    for item in raw_intervals:
+        if not isinstance(item, dict):
+            continue
+        try:
+            start_ts = float(item["start_timestamp"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        end_raw = item.get("end_timestamp", None)
+        if end_raw is None:
+            end_ts = None
+        else:
+            try:
+                end_ts = float(end_raw)
+            except (TypeError, ValueError):
+                continue
+        if end_ts is not None and end_ts <= start_ts:
+            continue
+        out.append(
+            {
+                "start_timestamp": start_ts,
+                "end_timestamp": end_ts,
+            }
+        )
+    out = sorted(out, key=lambda x: x["start_timestamp"])
+    for idx, item in enumerate(out):
+        item["segment_index"] = idx
+        item["is_calibration"] = bool(idx == 0)
+    return out
+
+
+def _build_intervals_from_start_end(starts, ends):
+    if not starts or not ends:
+        return []
+    intervals = []
+    end_idx = 0
+    for start_ts in starts:
+        while end_idx < len(ends) and ends[end_idx] <= start_ts:
+            end_idx += 1
+        if end_idx >= len(ends):
+            break
+        end_ts = ends[end_idx]
+        end_idx += 1
+        intervals.append(
+            {
+                "start_timestamp": float(start_ts),
+                "end_timestamp": float(end_ts),
+            }
+        )
+    return intervals
+
+
+def _build_intervals_from_legacy_starts(starts):
+    if not starts:
+        return []
+    intervals = []
+    for idx, start_ts in enumerate(starts):
+        end_ts = starts[idx + 1] if idx + 1 < len(starts) else None
+        intervals.append(
+            {
+                "start_timestamp": float(start_ts),
+                "end_timestamp": float(end_ts) if end_ts is not None else None,
+            }
+        )
+    return intervals
+
+
+def _load_capture_intervals(session_path: pathlib.Path):
     marks_path = session_path.joinpath("capture_marks.json")
     if not marks_path.is_file():
-        return [], None
+        return [], None, None
     with open(marks_path, "r", encoding="utf-8") as fp:
         payload = json.load(fp)
-    marks = _sanitize_marks(payload.get("trajectory_start_timestamps", []))
-    return marks, marks_path
+
+    has_new_schema = (
+        "trajectory_intervals" in payload
+        or "trajectory_end_timestamps" in payload
+    )
+
+    intervals = _sanitize_intervals(payload.get("trajectory_intervals", []))
+    source = "trajectory_intervals"
+    if not intervals:
+        start_marks = _sanitize_marks(payload.get("trajectory_start_timestamps", []))
+        end_marks = _sanitize_marks(payload.get("trajectory_end_timestamps", []))
+        intervals = _sanitize_intervals(_build_intervals_from_start_end(start_marks, end_marks))
+        source = "trajectory_start+end_timestamps"
+    if not intervals and not has_new_schema:
+        start_marks = _sanitize_marks(payload.get("trajectory_start_timestamps", []))
+        intervals = _sanitize_intervals(_build_intervals_from_legacy_starts(start_marks))
+        source = "legacy_trajectory_start_timestamps"
+
+    return intervals, marks_path, source
 
 
 def _load_latency_value(latency_json_path):
@@ -80,7 +167,7 @@ def _time_to_str(ts_unix: float):
     return datetime.fromtimestamp(ts_unix).strftime(r"%Y.%m.%d_%H.%M.%S.%f")
 
 
-def _segment_video_by_marks(mp4_path, output_dir, cam_serial, start_ts, marks, session_path):
+def _segment_video_by_intervals(mp4_path, output_dir, cam_serial, start_ts, intervals, session_path):
     cap = cv2.VideoCapture(str(mp4_path))
     if not cap.isOpened():
         raise OSError(f"Cannot open video: {mp4_path}")
@@ -97,23 +184,40 @@ def _segment_video_by_marks(mp4_path, output_dir, cam_serial, start_ts, marks, s
         )
 
     end_ts = start_ts + n_frames / fps
-    valid_starts = [t for t in marks if start_ts <= t < end_ts]
+    valid_intervals = []
+    for item in intervals:
+        seg_start_raw = item["start_timestamp"]
+        seg_end_raw = item.get("end_timestamp")
+        seg_start = max(start_ts, seg_start_raw)
+        seg_end_cap = end_ts if seg_end_raw is None else min(end_ts, seg_end_raw)
+        if seg_end_cap <= seg_start:
+            continue
+        valid_intervals.append(
+            {
+                "segment_index": int(item.get("segment_index", 0)),
+                "is_calibration": bool(item.get("is_calibration", False)),
+                "start_timestamp": float(seg_start),
+                "end_timestamp": float(seg_end_cap),
+            }
+        )
 
-    if len(valid_starts) == 0:
+    if len(valid_intervals) == 0:
         cap.release()
         return []
 
-    intervals = []
-    for idx, seg_start in enumerate(valid_starts):
-        seg_end = valid_starts[idx + 1] if idx + 1 < len(valid_starts) else end_ts
+    frame_intervals = []
+    for item in valid_intervals:
+        idx = item["segment_index"]
+        seg_start = item["start_timestamp"]
+        seg_end = item["end_timestamp"]
         start_frame = max(0, int((seg_start - start_ts) * fps))
         end_frame = min(n_frames, int((seg_end - start_ts) * fps))
         if end_frame - start_frame < 2:
             continue
-        intervals.append((idx, seg_start, seg_end, start_frame, end_frame))
+        frame_intervals.append((item, idx, seg_start, seg_end, start_frame, end_frame))
 
     created = []
-    for idx, seg_start, seg_end, start_frame, end_frame in intervals:
+    for item, idx, seg_start, seg_end, start_frame, end_frame in frame_intervals:
         out_dname = f"demo_{cam_serial}_{_time_to_str(seg_start)}"
         this_out_dir = output_dir.joinpath(out_dname)
         if this_out_dir.exists():
@@ -151,7 +255,8 @@ def _segment_video_by_marks(mp4_path, output_dir, cam_serial, start_ts, marks, s
         segment_meta = {
             "source_video": str(mp4_path.relative_to(session_path)),
             "segment_index": int(idx),
-            "is_calibration": bool(idx == 0),
+            "is_calibration": bool(item["is_calibration"]),
+            "is_usable_episode": bool(not item["is_calibration"]),
             "start_timestamp": float(seg_start),
             "end_timestamp": float(seg_end),
             "source_start_frame": int(start_frame),
@@ -195,22 +300,45 @@ def main(session_dir, latency_json):
         output_dir = session.joinpath('demos')          # 处理后的输出目录
         tactile_dir = get_single_path(session.glob('tactile_*'))  # 触觉数据目录
 
-        marks, marks_path = _load_capture_marks(session)
+        intervals, marks_path, interval_source = _load_capture_intervals(session)
         if marks_path is not None:
-            print(f"Loaded {len(marks)} trajectory marks from {marks_path}")
+            calib_count = sum(1 for item in intervals if item["is_calibration"])
+            episode_count = max(0, len(intervals) - calib_count)
+            print(
+                f"Loaded {len(intervals)} capture intervals from {marks_path} "
+                f"(source={interval_source}, calibration={calib_count}, usable_episode={episode_count})"
+            )
         else:
             print("No capture_marks.json found, fallback to original AR_00 behavior.")
 
         latency_value = _load_latency_value(latency_json)
-        if latency_value is not None and marks:
-            projected_marks = [m - latency_value for m in marks]
+        if latency_value is not None and intervals:
             print(
                 f"Loaded latency mean={latency_value:.6f}. "
-                "Using projected video marks = pose_mark - latency."
+                "Using projected video intervals = pose_interval - latency."
             )
-            for i, (m0, m1) in enumerate(zip(marks, projected_marks), start=1):
-                print(f"  mark#{i}: pose={m0:.6f} -> video={m1:.6f}")
-            marks = projected_marks
+            projected_intervals = []
+            for item in intervals:
+                pose_start = item["start_timestamp"]
+                pose_end = item.get("end_timestamp")
+                video_start = pose_start - latency_value
+                video_end = None if pose_end is None else (pose_end - latency_value)
+                projected_item = dict(item)
+                projected_item["start_timestamp"] = video_start
+                projected_item["end_timestamp"] = video_end
+                projected_intervals.append(projected_item)
+                if video_end is None:
+                    print(
+                        f"  interval#{item['segment_index']}: "
+                        f"pose=({pose_start:.6f}, None) -> video=({video_start:.6f}, None)"
+                    )
+                else:
+                    print(
+                        f"  interval#{item['segment_index']}: "
+                        f"pose=({pose_start:.6f}, {pose_end:.6f}) -> "
+                        f"video=({video_start:.6f}, {video_end:.6f})"
+                    )
+            intervals = projected_intervals
 
         
         # 检查raw_videos目录是否存在
@@ -241,22 +369,22 @@ def main(session_dir, latency_json):
                     or mp4_path.name.startswith('gripper_cal')
                     or mp4_path.parent.name.startswith('gripper_cal')
                 )
-                if marks and not is_special:
-                    created = _segment_video_by_marks(
+                if intervals and not is_special:
+                    created = _segment_video_by_intervals(
                         mp4_path=mp4_path,
                         output_dir=output_dir,
                         cam_serial=cam_serial,
                         start_ts=start_date.timestamp(),
-                        marks=marks,
+                        intervals=intervals,
                         session_path=session,
                     )
                     if created:
                         print(
-                            f"Segmented {mp4_path.name} into {len(created)} demos using trajectory marks."
+                            f"Segmented {mp4_path.name} into {len(created)} demos using capture intervals."
                         )
                         continue
                     print(
-                        f"No valid segment generated from marks for {mp4_path.name}, fallback to original move."
+                        f"No valid segment generated from intervals for {mp4_path.name}, fallback to original move."
                     )
                 
                 # 生成标准化的输出目录名格式: demo_<相机序列号>_<时间戳>

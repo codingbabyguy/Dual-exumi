@@ -6,7 +6,8 @@ Usage:
 
 Controls:
     w: start a new batch (creates batch_N subfolder)
-    u: mark current timestamp as a new trajectory start within current batch
+    u: mark current timestamp as current segment start
+    j: mark current timestamp as current segment end
     e: end current batch (flush and stop saving)
     d: delete current batch data and restart current batch id
     q: quit
@@ -120,7 +121,8 @@ class SharedState:
         self.vr_dir = None
         self.tactile_dir = None
         self.tactile_folder_name = None
-        self.trajectory_marks = []
+        self.trajectory_start_marks = []
+        self.trajectory_end_marks = []
 
     @staticmethod
     def marks_filename():
@@ -130,10 +132,28 @@ class SharedState:
         if self.current_batch_dir is None:
             return
         marks_path = os.path.join(self.current_batch_dir, self.marks_filename())
+        intervals = []
+        paired_count = min(len(self.trajectory_start_marks), len(self.trajectory_end_marks))
+        for idx in range(paired_count):
+            start_ts = self.trajectory_start_marks[idx]
+            end_ts = self.trajectory_end_marks[idx]
+            if end_ts <= start_ts:
+                continue
+            intervals.append(
+                {
+                    "segment_index": idx,
+                    "start_timestamp": float(start_ts),
+                    "end_timestamp": float(end_ts),
+                    "is_calibration": bool(idx == 0),
+                    "is_usable_episode": bool(idx >= 1),
+                }
+            )
         payload = {
             "batch_id": self.batch_id,
             "created_at": datetime.now().isoformat(),
-            "trajectory_start_timestamps": list(self.trajectory_marks),
+            "trajectory_start_timestamps": list(self.trajectory_start_marks),
+            "trajectory_end_timestamps": list(self.trajectory_end_marks),
+            "trajectory_intervals": intervals,
         }
         with open(marks_path, "w", encoding="utf-8") as fp:
             json.dump(payload, fp, indent=2)
@@ -159,7 +179,8 @@ class SharedState:
             self.current_batch_dir = batch_dir
             self.vr_dir = vr_dir
             self.tactile_dir = tactile_dir
-            self.trajectory_marks = []
+            self.trajectory_start_marks = []
+            self.trajectory_end_marks = []
             self._persist_marks_locked()
             print(f"[INFO] Batch {self.batch_id} started. Directories created:")
             print(f"  - VR数据: {vr_dir}")
@@ -172,17 +193,59 @@ class SharedState:
     def mark_trajectory_start(self):
         with self.lock:
             if not self.batch_active or self.current_batch_dir is None:
-                return None
+                return {"ok": False, "reason": "no_batch"}
+
+            if len(self.trajectory_start_marks) > len(self.trajectory_end_marks):
+                open_start_ts = self.trajectory_start_marks[len(self.trajectory_end_marks)]
+                return {
+                    "ok": False,
+                    "reason": "unclosed_segment",
+                    "open_start_ts": open_start_ts,
+                    "open_start_readable": timestamp_to_readable(open_start_ts),
+                }
 
             ts = time.time()
-            self.trajectory_marks.append(ts)
+            self.trajectory_start_marks.append(ts)
             self._persist_marks_locked()
 
             return {
+                "ok": True,
                 "batch_id": self.batch_id,
                 "timestamp": ts,
                 "readable": timestamp_to_readable(ts),
-                "index": len(self.trajectory_marks),
+                "index": len(self.trajectory_start_marks),
+                "mark_type": "start",
+                "is_calibration": bool(len(self.trajectory_start_marks) == 1),
+                "path": os.path.join(self.current_batch_dir, self.marks_filename()),
+            }
+
+    def mark_trajectory_end(self):
+        with self.lock:
+            if not self.batch_active or self.current_batch_dir is None:
+                return {"ok": False, "reason": "no_batch"}
+
+            if len(self.trajectory_start_marks) <= len(self.trajectory_end_marks):
+                return {"ok": False, "reason": "no_open_segment"}
+
+            ts = time.time()
+            open_index = len(self.trajectory_end_marks)
+            start_ts = self.trajectory_start_marks[open_index]
+            if ts <= start_ts:
+                ts = start_ts + 1e-6
+            self.trajectory_end_marks.append(ts)
+            self._persist_marks_locked()
+
+            paired_index = len(self.trajectory_end_marks)
+            return {
+                "ok": True,
+                "batch_id": self.batch_id,
+                "timestamp": ts,
+                "readable": timestamp_to_readable(ts),
+                "index": paired_index,
+                "mark_type": "end",
+                "start_timestamp": start_ts,
+                "start_readable": timestamp_to_readable(start_ts),
+                "is_calibration": bool(paired_index == 1),
                 "path": os.path.join(self.current_batch_dir, self.marks_filename()),
             }
 
@@ -200,7 +263,15 @@ class SharedState:
             print(f"  - 触觉数据: {finished_dir}/{self.tactile_folder_name}/")
             print(f"  - 标定视频: {finished_dir}/latency_calibration/")
             print(f"  - 原始视频: {finished_dir}/raw_videos/")
-            print(f"  - 轨迹打点数: {len(self.trajectory_marks)}")
+            print(f"  - U起点数: {len(self.trajectory_start_marks)}")
+            print(f"  - J终点数: {len(self.trajectory_end_marks)}")
+            print(f"  - 已闭合区间数(u-j): {min(len(self.trajectory_start_marks), len(self.trajectory_end_marks))}")
+            if len(self.trajectory_start_marks) > len(self.trajectory_end_marks):
+                open_start_ts = self.trajectory_start_marks[len(self.trajectory_end_marks)]
+                print(
+                    "  - [WARN] 存在未闭合区间(只有u没有j): "
+                    f"{timestamp_to_readable(open_start_ts)}，该段不会进入后处理切分"
+                )
             print(f"  - 打点文件: {finished_dir}/{self.marks_filename()}")
 
             self._persist_marks_locked()
@@ -209,7 +280,8 @@ class SharedState:
             self.vr_dir = None
             self.tactile_dir = None
             self.tactile_folder_name = None
-            self.trajectory_marks = []
+            self.trajectory_start_marks = []
+            self.trajectory_end_marks = []
             self.batch_id += 1
             return finished_dir
 
@@ -221,13 +293,23 @@ class SharedState:
                 "tactile_dir": self.tactile_dir,
                 "batch_id": self.batch_id,
                 "batch_dir": self.current_batch_dir,
-                "mark_count": len(self.trajectory_marks),
+                "start_mark_count": len(self.trajectory_start_marks),
+                "end_mark_count": len(self.trajectory_end_marks),
             }
 
     def status_text(self):
         with self.lock:
             mode = "采集中" if self.batch_active else "待机"
-            return f"当前batch: {self.batch_id} | 状态: {mode} | 打点数: {len(self.trajectory_marks)}"
+            open_flag = ""
+            if len(self.trajectory_start_marks) > len(self.trajectory_end_marks):
+                open_flag = " | 当前区间: 进行中"
+            return (
+                f"当前batch: {self.batch_id} | 状态: {mode} | "
+                f"U: {len(self.trajectory_start_marks)} | "
+                f"J: {len(self.trajectory_end_marks)} | "
+                f"闭合区间: {min(len(self.trajectory_start_marks), len(self.trajectory_end_marks))}"
+                f"{open_flag}"
+            )
 
     def delete_and_restart_current_batch(self):
         with self.lock:
@@ -249,7 +331,8 @@ class SharedState:
 
             self.vr_dir = vr_dir
             self.tactile_dir = tactile_dir
-            self.trajectory_marks = []
+            self.trajectory_start_marks = []
+            self.trajectory_end_marks = []
             self._persist_marks_locked()
             return {
                 "batch_dir": batch_dir,
@@ -493,7 +576,8 @@ def main():
         print("  ├── tactile_YYYYMMDD_HHMMSS/  # 触觉数据文件夹")
         print("  ├── latency_calibration/ # 标定视频(预留)")
         print("  └── raw_videos/         # 原始视频(预留)")
-        print("[MAIN] 按 'w' 开始batch, 'u' 记录轨迹起点, 'e' 结束当前batch, 'd' 删除并重采当前batch, 'q' 退出")
+        print("[MAIN] 按 'w' 开始batch, 'u' 记录区间起点, 'j' 记录区间终点, 'e' 结束当前batch, 'd' 删除并重采当前batch, 'q' 退出")
+        print("[MAIN] 规则: 第1个 u-j 区间为ArUco标定段；从第2个u-j区间开始作为可用episode。")
 
         state = SharedState(root_dir)
         stop_event = threading.Event()
@@ -524,14 +608,46 @@ def main():
                         print(f"[MAIN][STATUS] {state.status_text()}")
                     elif key == "u":
                         mark_info = state.mark_trajectory_start()
-                        if mark_info:
+                        if mark_info.get("ok"):
+                            seg_role = "ArUco标定段起点" if mark_info["is_calibration"] else "episode起点"
                             print(
-                                f"[MAIN] 轨迹打点 #{mark_info['index']}: {mark_info['readable']} "
+                                f"[MAIN] U打点 #{mark_info['index']} ({seg_role}): {mark_info['readable']} "
                                 f"(Unix {mark_info['timestamp']:.6f})"
                             )
                             print(f"[MAIN] 打点文件已更新: {mark_info['path']}")
                         else:
-                            print("[MAIN] 当前没有进行中的 batch，无法记录打点。")
+                            reason = mark_info.get("reason")
+                            if reason == "no_batch":
+                                print("[MAIN] 当前没有进行中的 batch，无法记录U打点。")
+                            elif reason == "unclosed_segment":
+                                print(
+                                    "[MAIN] 上一个区间还没按j结束，请先按 'j' 结束当前区间。"
+                                    f" 未闭合起点: {mark_info.get('open_start_readable')}"
+                                )
+                            else:
+                                print("[MAIN] U打点失败。")
+                        print(f"[MAIN][STATUS] {state.status_text()}")
+                    elif key == "j":
+                        mark_info = state.mark_trajectory_end()
+                        if mark_info.get("ok"):
+                            seg_role = "ArUco标定段" if mark_info["is_calibration"] else "episode"
+                            print(
+                                f"[MAIN] J打点 #{mark_info['index']} ({seg_role}结束): {mark_info['readable']} "
+                                f"(Unix {mark_info['timestamp']:.6f})"
+                            )
+                            print(
+                                f"[MAIN] 区间#{mark_info['index']}范围: {mark_info['start_readable']} -> "
+                                f"{mark_info['readable']}"
+                            )
+                            print(f"[MAIN] 打点文件已更新: {mark_info['path']}")
+                        else:
+                            reason = mark_info.get("reason")
+                            if reason == "no_batch":
+                                print("[MAIN] 当前没有进行中的 batch，无法记录J打点。")
+                            elif reason == "no_open_segment":
+                                print("[MAIN] 当前没有未闭合区间，请先按 'u' 再按 'j'。")
+                            else:
+                                print("[MAIN] J打点失败。")
                         print(f"[MAIN][STATUS] {state.status_text()}")
                     elif key == "e":
                         finished_dir = state.end_batch()

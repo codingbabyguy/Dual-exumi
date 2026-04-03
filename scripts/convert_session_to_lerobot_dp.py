@@ -427,7 +427,6 @@ def main() -> None:
 
                 state = np.concatenate([xyz, rot6d, grip], axis=0).astype(np.float32)
                 action = state.copy()
-                timestamp = ep.start_timestamp + frame_idx / ep.fps
 
                 dataset.add_frame(
                     {
@@ -435,7 +434,6 @@ def main() -> None:
                         "observation.state": state,
                         "action": action,
                         "task": task_name,
-                        "timestamp": float(timestamp),
                     }
                 )
 
