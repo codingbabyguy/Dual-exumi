@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -108,6 +109,11 @@ def parse_args() -> argparse.Namespace:
         "--allow_legacy_frame",
         action="store_true",
         help="Allow non-manual_relative_frame aligned poses (not recommended).",
+    )
+    parser.add_argument(
+        "--overwrite_output",
+        action="store_true",
+        help="If set, remove existing output_dir before creating dataset.",
     )
     return parser.parse_args()
 
@@ -205,10 +211,15 @@ def load_calibration(session_dir: Path) -> dict | None:
         }
 
 
-def ensure_empty_output_dir(path: Path) -> None:
-    if path.exists() and any(path.iterdir()):
-        raise FileExistsError(f"Output directory is not empty: {path}")
-    path.mkdir(parents=True, exist_ok=True)
+def prepare_output_dir(path: Path, overwrite_output: bool) -> None:
+    if path.exists():
+        if overwrite_output:
+            shutil.rmtree(path)
+        else:
+            raise FileExistsError(
+                f"Output directory already exists: {path}. "
+                "Please remove it, choose a new --output_dir, or pass --overwrite_output."
+            )
 
 
 def quat_xyzw_to_rot6d(quat_xyzw: np.ndarray) -> np.ndarray:
@@ -394,7 +405,7 @@ def main() -> None:
     repo_id = args.repo_id or f"local/{output_dir.name}"
     task_name = args.task or session_dir.name
     image_hw = (int(args.image_height), int(args.image_width))
-    ensure_empty_output_dir(output_dir)
+    prepare_output_dir(output_dir, overwrite_output=bool(args.overwrite_output))
 
     print(f"[INFO] session_dir={session_dir}")
     print(f"[INFO] output_dir ={output_dir}")
