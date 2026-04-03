@@ -104,6 +104,11 @@ def parse_args() -> argparse.Namespace:
         default=6,
         help="How many processed frames to keep for the montage report.",
     )
+    parser.add_argument(
+        "--allow_legacy_frame",
+        action="store_true",
+        help="Allow non-manual_relative_frame aligned poses (not recommended).",
+    )
     return parser.parse_args()
 
 
@@ -146,17 +151,34 @@ def discover_episodes(session_dir: Path) -> list[EpisodeMeta]:
     return metas
 
 
-def load_aligned_episode(meta: EpisodeMeta) -> tuple[np.ndarray, np.ndarray]:
+def _resolve_aligned_pose_coordinate_frame(aligned_obj: dict, aligned_pose_path: Path) -> str:
+    frame = aligned_obj.get("coordinate_frame")
+    if frame is None and isinstance(aligned_obj.get("metadata"), dict):
+        frame = aligned_obj["metadata"].get("coordinate_frame")
+    if frame is None:
+        summary_path = aligned_pose_path.parent / "aligned_pose_summary.json"
+        if summary_path.is_file():
+            try:
+                frame = load_json(summary_path).get("coordinate_frame")
+            except Exception:
+                frame = None
+    if frame is None:
+        return "manual_relative_frame"
+    return str(frame).strip()
+
+
+def load_aligned_episode(meta: EpisodeMeta) -> tuple[np.ndarray, np.ndarray, str]:
     obj = load_json(meta.aligned_pose_path)
     pose = np.asarray(obj.get("pose"), dtype=np.float64)
     width = np.asarray(obj.get("width"), dtype=np.float64).reshape(-1)
+    coordinate_frame = _resolve_aligned_pose_coordinate_frame(obj, meta.aligned_pose_path)
     if pose.ndim != 2 or pose.shape[1] != 7:
         raise ValueError(f"Invalid pose shape in {meta.aligned_pose_path}: {pose.shape}")
     if len(width) != len(pose):
         raise ValueError(
             f"Pose/width length mismatch in {meta.aligned_pose_path}: pose={len(pose)} width={len(width)}"
         )
-    return pose, width
+    return pose, width, coordinate_frame
 
 
 def find_calibration_file(session_dir: Path) -> Path | None:
@@ -328,6 +350,7 @@ def build_deployment_template(
             "gripper_unit": "normalized",
         },
         "safety": {
+            "enable_policy_workspace_clip": True,
             "action_bounds": {
                 name: [float(action_min[i]), float(action_max[i])] for i, name in enumerate(ACTION_NAMES)
             },
@@ -344,9 +367,20 @@ def build_deployment_template(
                 "image_shape": list(image_shape),
                 "use_sdk_pose_transform": True,
                 "lock_work_tool_frame": True,
+                "frame_lock_require_expected_names": True,
                 "expected_work_frame_names": [],
                 "expected_tool_frame_names": [],
                 "workspace_clip_in_adapter": False,
+                "runtime_joint_guard": {
+                    "enabled": True,
+                    "warn_only": False,
+                    "joint_limit_margin_deg": 8.0,
+                    "max_joint_step_deg": 6.0,
+                    "enable_self_collision_check": False,
+                    "enable_singularity_check": True,
+                    "require_algo_checks": False,
+                    "fail_on_ik_error": True,
+                },
             }
         },
         "calibration": calibration,
@@ -376,10 +410,17 @@ def main() -> None:
     width_values: list[np.ndarray] = []
     pose_cache: dict[str, np.ndarray] = {}
     width_cache: dict[str, np.ndarray] = {}
+    frame_cache: dict[str, str] = {}
     for ep in episodes:
-        pose_arr, width_arr = load_aligned_episode(ep)
+        pose_arr, width_arr, coordinate_frame = load_aligned_episode(ep)
+        if (coordinate_frame != "manual_relative_frame") and (not args.allow_legacy_frame):
+            raise ValueError(
+                f"{ep.aligned_pose_path} is in {coordinate_frame!r}, expected manual_relative_frame. "
+                "Run AR_03 without --legacy_flexiv_transform, or pass --allow_legacy_frame if intentional."
+            )
         pose_cache[ep.episode_name] = pose_arr
         width_cache[ep.episode_name] = width_arr
+        frame_cache[ep.episode_name] = coordinate_frame
         width_values.append(width_arr)
     all_width = np.concatenate(width_values, axis=0)
     width_min = float(np.min(all_width))
@@ -404,8 +445,12 @@ def main() -> None:
     for episode_index, ep in enumerate(episodes):
         pose_arr = pose_cache[ep.episode_name]
         width_arr = width_cache[ep.episode_name]
+        coordinate_frame = frame_cache[ep.episode_name]
         decoded_frames = 0
-        print(f"[EP {episode_index:03d}] {ep.episode_name} | frames={len(pose_arr)} | fps={ep.fps:.6f}")
+        print(
+            f"[EP {episode_index:03d}] {ep.episode_name} | frames={len(pose_arr)} | "
+            f"fps={ep.fps:.6f} | frame={coordinate_frame}"
+        )
 
         with av.open(str(ep.video_path), "r") as container:
             stream = container.streams.video[0]
@@ -461,6 +506,7 @@ def main() -> None:
 
     report_dir = output_dir / "reports"
     report_dir.mkdir(parents=True, exist_ok=True)
+    coordinate_frames_seen = sorted(set(frame_cache.values()))
 
     if first_episode_states:
         save_state_action_plot(
@@ -480,6 +526,7 @@ def main() -> None:
         "total_episodes": len(episodes),
         "total_frames": int(total_frames),
         "fps": float(common_fps),
+        "aligned_pose_coordinate_frames": coordinate_frames_seen,
         "image_shape": [int(args.image_height), int(args.image_width), 3],
         "gripper_width_raw_min": width_min,
         "gripper_width_raw_max": width_max,
@@ -497,6 +544,27 @@ def main() -> None:
     )
     with (report_dir / "deployment_manual_frame_template.json").open("w", encoding="utf-8") as f:
         json.dump(deployment_template, f, indent=2, ensure_ascii=False)
+
+    contract = {
+        "coordinate_frame": "manual_relative_frame",
+        "manual_frame_definition": {
+            "position": "p_manual = R_manual^T (p_base - o_manual)",
+            "rotation": "R_manual_obj = R_manual^T R_base_obj",
+        },
+        "inference_inverse_mapping": {
+            "position": "p_base = o_manual + R_manual p_manual",
+            "rotation": "R_base_obj = R_manual R_manual_obj",
+        },
+        "action_semantics": "absolute_manual_pose_target_10d",
+        "state_semantics": "absolute_manual_pose_state_10d",
+        "notes": [
+            "action equals state during conversion (behavior cloning target).",
+            "manual_origin/manual_rotation must come from the same collection calibration.",
+            "Do not enable startup anchor remapping unless training also used startup-relative frame.",
+        ],
+    }
+    with (report_dir / "manual_frame_contract.json").open("w", encoding="utf-8") as f:
+        json.dump(contract, f, indent=2, ensure_ascii=False)
 
     print(f"[DONE] dataset root : {output_dir}")
     print(f"[DONE] info.json    : {info_path}")

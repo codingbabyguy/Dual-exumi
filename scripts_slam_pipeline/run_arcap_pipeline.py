@@ -114,6 +114,8 @@ def main(
             # "--tx_slam_tag", "example/tx_slam_tag_identity.json",
             # "--use_arcap_trajectory",
         ]
+        if legacy_flexiv_transform:
+            cmd.append('--allow_legacy_frame')
         if gripper_threshold:
             cmd.extend(["--gripper_threshold", str(gripper_threshold)])
         result = subprocess.run(cmd)

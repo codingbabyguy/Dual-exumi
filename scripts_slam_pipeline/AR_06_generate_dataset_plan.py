@@ -88,6 +88,23 @@ def resolve_camera_serial(video_dir: pathlib.Path, session_dir: pathlib.Path, et
     return "UNKNOWN_CAMERA"
 
 
+def resolve_coordinate_frame(video_dir: pathlib.Path, proprio_data: dict) -> str:
+    frame = proprio_data.get("coordinate_frame")
+    if frame is None and isinstance(proprio_data.get("metadata"), dict):
+        frame = proprio_data["metadata"].get("coordinate_frame")
+    if frame is None:
+        summary_path = video_dir.joinpath("aligned_pose_summary.json")
+        if summary_path.is_file():
+            try:
+                with open(summary_path, "r") as fp:
+                    frame = json.load(fp).get("coordinate_frame")
+            except Exception:
+                frame = None
+    if frame is None:
+        return "manual_relative_frame"
+    return str(frame).strip()
+
+
 # %%
 @click.command()
 @click.option('-i', '--input', required=True, help='Project directory')
@@ -96,7 +113,8 @@ def resolve_camera_serial(video_dir: pathlib.Path, session_dir: pathlib.Path, et
 @click.option('--ignore_cameras', type=str, default=None, help="comma separated string of camera serials to ignore")
 @click.option('-gth', '--gripper_threshold', type=float, default=None, help="")
 @click.option('--check_realsense', is_flag=True, default=False)
-def main(input, output, tcp_offset, ignore_cameras, gripper_threshold, check_realsense):
+@click.option('--allow_legacy_frame', is_flag=True, default=False, help="Allow non-manual coordinate frame trajectory.")
+def main(input, output, tcp_offset, ignore_cameras, gripper_threshold, check_realsense, allow_legacy_frame):
     # %% stage 0
     # gather inputs
     input_path = pathlib.Path(os.path.expanduser(input)).absolute()
@@ -223,6 +241,12 @@ def main(input, output, tcp_offset, ignore_cameras, gripper_threshold, check_rea
         assert json_path.is_file()
 
         proprio_data = json.load(open(json_path, 'r'))
+        coordinate_frame = resolve_coordinate_frame(video_dir, proprio_data)
+        if (coordinate_frame != "manual_relative_frame") and (not allow_legacy_frame):
+            raise ValueError(
+                f"{json_path} coordinate_frame={coordinate_frame!r}, expected manual_relative_frame. "
+                "Run AR_03 without legacy transform or pass --allow_legacy_frame."
+            )
         cam_7dpose = np.array(proprio_data['pose'])
         cam_pos = cam_7dpose[:, :3]
         cam_rot_quat_xyzw = cam_7dpose[:, 3:]
@@ -271,7 +295,12 @@ def main(input, output, tcp_offset, ignore_cameras, gripper_threshold, check_rea
         all_plans.append({
             "episode_timestamps": demo_timestamps,
             "grippers": [grippers],
-            "cameras": [cameras]
+            "cameras": [cameras],
+            "metadata": {
+                "coordinate_frame": coordinate_frame,
+                "trajectory_file": trajectory_file,
+                "legacy_frame_allowed": bool(allow_legacy_frame),
+            },
         })
 
     # dump the plan to pickle

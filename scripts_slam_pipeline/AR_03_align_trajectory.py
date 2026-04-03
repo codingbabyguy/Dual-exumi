@@ -290,6 +290,7 @@ def main(
             aligned_proprio_data.append( {
                 'pose': _pose.tolist(),
                 'width': float(_width),  # (1,) ->  float
+                'timestamp': float(timestamp),
             } )
 
             # 触觉数据后处理
@@ -325,15 +326,27 @@ def main(
         # 保存对齐后的姿态数据为json
         with open(video_dir.joinpath('aligned_arcap_poses.json'), 'w') as fp:
             proprio_data = listOfDict_to_dictOfList(aligned_proprio_data)
+            coordinate_frame = "legacy_flexiv_frame" if legacy_flexiv_transform else "manual_relative_frame"
+            proprio_data["coordinate_frame"] = coordinate_frame
+            proprio_data["metadata"] = {
+                "coordinate_frame": coordinate_frame,
+                "pose_semantics": "absolute_pose_in_coordinate_frame",
+                "legacy_flexiv_transform_applied": bool(legacy_flexiv_transform),
+                "source": "AR_03_align_trajectory.py",
+                "fps": float(fps),
+                "start_timestamp": float(start_timestamp),
+                "notes": [
+                    "AR_03 keeps collection spatial semantics by default and only aligns timestamps.",
+                    "legacy_flexiv_transform=true rewrites pose frame for historical compatibility.",
+                ],
+            }
             json.dump(proprio_data, fp)
 
         if save_pose_debug:
             pose_arr = np.asarray(proprio_data["pose"], dtype=np.float64)
             width_arr = np.asarray(proprio_data["width"], dtype=np.float64)
             summary = summarize_pose_series(pose_arr, width_arr, float(fps))
-            summary["coordinate_frame"] = (
-                "legacy_flexiv_frame" if legacy_flexiv_transform else "manual_relative_frame"
-            )
+            summary["coordinate_frame"] = coordinate_frame
             with open(video_dir.joinpath('aligned_pose_summary.json'), 'w') as fp:
                 json.dump(summary, fp, indent=2)
             save_pose_debug_plot(video_dir, pose_arr, width_arr, float(fps))
