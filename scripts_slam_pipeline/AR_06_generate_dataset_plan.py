@@ -17,6 +17,7 @@ import pickle
 import numpy as np
 import json
 import re
+import datetime
 import numpy as np
 from scipy.spatial.transform import Rotation
 from tqdm import tqdm
@@ -105,6 +106,42 @@ def resolve_coordinate_frame(video_dir: pathlib.Path, proprio_data: dict) -> str
     return str(frame).strip()
 
 
+def resolve_video_start_timestamp(video_dir: pathlib.Path) -> float:
+    """Resolve demo start timestamp robustly.
+
+    Priority:
+    1) MP4 metadata (`mp4_get_start_datetime`)
+    2) Parse from demo folder name: demo_<serial>_<YYYY.MM.DD_HH.MM.SS[.ffffff]>
+    """
+    mp4_path = video_dir.joinpath("raw_video.mp4")
+
+    # 1) Try metadata from video file.
+    if mp4_path.is_file():
+        try:
+            start_date = mp4_get_start_datetime(str(mp4_path))
+            if start_date is not None:
+                return float(start_date.timestamp())
+        except Exception:
+            pass
+
+    # 2) Fallback to demo folder naming convention.
+    m = re.match(r"^demo_[^_]+_(.+)$", video_dir.name)
+    if m is not None:
+        stamp = m.group(1)
+        for fmt in ("%Y.%m.%d_%H.%M.%S.%f", "%Y.%m.%d_%H.%M.%S"):
+            try:
+                dt = datetime.datetime.strptime(stamp, fmt)
+                return float(dt.timestamp())
+            except ValueError:
+                continue
+
+    raise RuntimeError(
+        f"Cannot resolve start timestamp for {video_dir}. "
+        "Need valid mp4 metadata or demo folder name in pattern "
+        "demo_<serial>_<YYYY.MM.DD_HH.MM.SS[.ffffff]>."
+    )
+
+
 # %%
 @click.command()
 @click.option('-i', '--input', required=True, help='Project directory')
@@ -157,8 +194,8 @@ def main(input, output, tcp_offset, ignore_cameras, gripper_threshold, check_rea
         for video_dir in video_dirs:            
             mp4_path = video_dir.joinpath('raw_video.mp4')
             cam_serial = resolve_camera_serial(video_dir, input_path, et)
-            start_date = mp4_get_start_datetime(str(mp4_path))
-            start_timestamp = start_date.timestamp()
+            start_timestamp = resolve_video_start_timestamp(video_dir)
+            start_date = datetime.datetime.fromtimestamp(start_timestamp)
 
             if cam_serial in ignore_cam_serials:
                 print(f"Ignored {video_dir.name}")
