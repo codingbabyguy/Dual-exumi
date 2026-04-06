@@ -1,0 +1,52 @@
+robot:
+  urdf_path: "/Users/wangyi/Vscode/vscode_python_work/tactile_work/tactile_work/Dual-exumi/RM-65/（4）ROS资料/V1.5/rm_65_robot/rm_65_description/urdf/rm_65_description.urdf"
+  ee_frame_name: "Link6"
+  solve_frame: "flange"
+
+frames:
+  # B(base) <- pose_frame(manual_relative_frame by default in AR_03)
+  T_B_from_pose_frame:
+    xyz: [0.0, 0.0, 0.0]
+    rpy_rad: [0.0, 0.0, 0.0]
+
+  # input pose -> policy tcp
+  # If aligned_arcap_poses.json already stores TCP pose, keep identity.
+  T_pose_to_tcp:
+    xyz: [0.0, 0.0, 0.0]
+    rpy_rad: [0.0, 0.0, 0.0]
+
+  # F(flange) -> T(tcp), default from rm_65_flange.urdf.xacro:
+  # <origin xyz="0 0 0.03103" rpy="0 0 3.14" />
+  T_flange_to_tcp:
+    xyz: [0.0, 0.0, 0.03103]
+    rpy_rad: [0.0, 0.0, 3.14]
+
+ik:
+  n_random_seeds: 8
+  random_seed: 42
+  max_nfev: 100
+  pos_tol_m: 0.008
+  rot_tol_deg: 8.0
+  dedup_joint_tol_rad: 0.02
+  max_candidates_per_frame: 12
+
+selection:
+  w_local_pos: 1.0
+  w_local_rot: 0.4
+  w_local_limit: 0.01
+  w_local_sing: 0.01
+  w_transition_smooth: 0.3
+  branch_jump_rad: 0.6
+  branch_penalty: 2.0
+  failed_candidate_penalty: 20.0
+
+report:
+  near_limit_threshold_rad: 0.08
+  near_singular_threshold: 0.03
+
+rm_baseline:
+  enable: false
+  rm_api_python_dir: "/Users/wangyi/Vscode/vscode_python_work/tactile_work/tactile_work/Dual-exumi/RM_API2/Python"
+  arm_model: "RM_65"
+  force_type: "RM_B"
+
