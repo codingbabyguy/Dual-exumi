@@ -5,6 +5,7 @@ import argparse
 from pathlib import Path
 import re
 import tempfile
+import shutil
 
 import numpy as np
 
@@ -39,29 +40,67 @@ def _rewrite_urdf_package_paths(urdf_path: Path) -> Path:
 
     package_root = urdf_path.parent.parent  # .../rm_65_description
     package_name = package_root.name
-    replacement = package_root.as_posix().rstrip("/") + "/"
-    text = text.replace(f"package://{package_name}/", replacement)
-
-    # Best-effort generic fallback for other package names:
-    # package://<pkg>/foo -> <workspace>/<pkg>/foo, where workspace is parent of package_root.
     workspace_root = package_root.parent
+
+    tmp_dir = Path(tempfile.mkdtemp(prefix="mujoco_rm65_"))
+    tmp_urdf = tmp_dir / "model.urdf"
+
+    mesh_ref_pat = re.compile(r'filename="([^"]+)"')
+    matches = list(mesh_ref_pat.finditer(text))
+    new_text = text
+    offset = 0
+
+    def _resolve_source(raw_ref: str) -> Path | None:
+        if raw_ref.startswith("package://"):
+            rest = raw_ref[len("package://") :]
+            if "/" not in rest:
+                return None
+            pkg, rel = rest.split("/", 1)
+            if pkg == package_name:
+                cand = package_root / rel
+            else:
+                cand = workspace_root / pkg / rel
+            return cand if cand.is_file() else None
+        p = Path(raw_ref)
+        if p.is_absolute():
+            return p if p.is_file() else None
+        # relative to urdf file
+        cand = urdf_path.parent / p
+        return cand if cand.is_file() else None
+
+    copied_names: set[str] = set()
+    for m in matches:
+        raw_ref = m.group(1)
+        src = _resolve_source(raw_ref)
+        if src is None:
+            continue
+        basename = src.name
+        dst = tmp_dir / basename
+        if basename not in copied_names:
+            shutil.copy2(src, dst)
+            copied_names.add(basename)
+        # Some MuJoCo URDF parsers only show/load basename; keep it simple and local.
+        start, end = m.span(1)
+        start += offset
+        end += offset
+        new_text = new_text[:start] + basename + new_text[end:]
+        offset += len(basename) - (end - start)
+
+    # As fallback, keep package URI rewriting too (for refs we didn't touch).
+    replacement = package_root.as_posix().rstrip("/") + "/"
+    new_text = new_text.replace(f"package://{package_name}/", replacement)
 
     def _generic_replace(match: re.Match[str]) -> str:
         pkg = match.group(1)
-        if pkg == package_name:
-            return replacement
-        candidate = workspace_root / pkg
-        if candidate.is_dir():
-            return candidate.as_posix().rstrip("/") + "/"
+        cand = workspace_root / pkg
+        if cand.is_dir():
+            return cand.as_posix().rstrip("/") + "/"
         return match.group(0)
 
-    text = re.sub(r"package://([^/]+)/", _generic_replace, text)
+    new_text = re.sub(r"package://([^/]+)/", _generic_replace, new_text)
 
-    tmp = tempfile.NamedTemporaryFile(prefix="mujoco_rewrite_", suffix=".urdf", delete=False)
-    tmp_path = Path(tmp.name)
-    tmp.write(text.encode("utf-8"))
-    tmp.close()
-    return tmp_path
+    tmp_urdf.write_text(new_text, encoding="utf-8")
+    return tmp_urdf
 
 
 def main() -> None:
