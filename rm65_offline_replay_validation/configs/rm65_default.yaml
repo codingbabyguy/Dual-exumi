@@ -1,5 +1,5 @@
 robot:
-  urdf_path: "/Users/wangyi/Vscode/vscode_python_work/tactile_work/tactile_work/Dual-exumi/RM-65/（4）ROS资料/V1.5/rm_65_robot/rm_65_description/urdf/rm_65_description.urdf"
+  urdf_path: "/home/icrlab/tactile_work_Wy/Dual-exumi/RM-65/Ros/rm_65_robot/rm_65_description/urdf"
   ee_frame_name: "Link6"
   solve_frame: "flange"
 
@@ -46,7 +46,7 @@ report:
 
 rm_baseline:
   enable: false
-  rm_api_python_dir: "/Users/wangyi/Vscode/vscode_python_work/tactile_work/tactile_work/Dual-exumi/RM_API2/Python"
+  rm_api_python_dir: "/home/icrlab/tactile_work_Wy/Dual-exumi/RM_API2/Python"
   arm_model: "RM_65"
   force_type: "RM_B"
 
