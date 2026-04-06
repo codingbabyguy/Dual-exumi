@@ -54,7 +54,7 @@ rm65_offline_replay_validation/
 
 ## 服务器运行步骤
 
-1. 安装依赖
+1. 安装核心依赖（不含 MuJoCo）
 
 ```bash
 cd /Users/wangyi/Vscode/vscode_python_work/tactile_work/tactile_work/Dual-exumi/rm65_offline_replay_validation
@@ -94,6 +94,12 @@ python scripts/run_offline_validation.py \
 
 5. MuJoCo 回放（可选）
 
+先安装可视化依赖：
+
+```bash
+pip install -r requirements-mujoco.txt
+```
+
 ```bash
 python scripts/replay_mujoco.py \
   --urdf_path "<urdf路径>" \
@@ -107,6 +113,10 @@ python scripts/replay_mujoco.py \
 export MUJOCO_GL=osmesa
 ```
 
+若 `pip install mujoco` 失败，通常是 Python 版本或平台 wheel 不匹配。建议：
+- 换 Python 3.10/3.11 虚拟环境后再安装
+- 或使用 conda-forge 安装 MuJoCo
+
 ## 可选：RM_API2 基线对照
 
 `configs/rm65_default.yaml` 中：
@@ -114,4 +124,3 @@ export MUJOCO_GL=osmesa
 - `rm_baseline.rm_api_python_dir` 指向 `RM_API2/Python`
 
 若 SDK 依赖完整，主脚本会附带输出 RM baseline IK 的成功率对照。
-
