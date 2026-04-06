@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+import re
+import tempfile
 
 import numpy as np
 
@@ -24,6 +26,44 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _rewrite_urdf_package_paths(urdf_path: Path) -> Path:
+    """
+    Rewrite package:// URIs in URDF to absolute paths for MuJoCo.
+
+    Example:
+    package://rm_65_description/meshes/Link1.STL
+      -> /abs/.../rm_65_description/meshes/Link1.STL
+    """
+    urdf_path = urdf_path.expanduser().resolve()
+    text = urdf_path.read_text(encoding="utf-8")
+
+    package_root = urdf_path.parent.parent  # .../rm_65_description
+    package_name = package_root.name
+    replacement = package_root.as_posix().rstrip("/") + "/"
+    text = text.replace(f"package://{package_name}/", replacement)
+
+    # Best-effort generic fallback for other package names:
+    # package://<pkg>/foo -> <workspace>/<pkg>/foo, where workspace is parent of package_root.
+    workspace_root = package_root.parent
+
+    def _generic_replace(match: re.Match[str]) -> str:
+        pkg = match.group(1)
+        if pkg == package_name:
+            return replacement
+        candidate = workspace_root / pkg
+        if candidate.is_dir():
+            return candidate.as_posix().rstrip("/") + "/"
+        return match.group(0)
+
+    text = re.sub(r"package://([^/]+)/", _generic_replace, text)
+
+    tmp = tempfile.NamedTemporaryFile(prefix="mujoco_rewrite_", suffix=".urdf", delete=False)
+    tmp_path = Path(tmp.name)
+    tmp.write(text.encode("utf-8"))
+    tmp.close()
+    return tmp_path
+
+
 def main() -> None:
     args = parse_args()
     try:
@@ -40,7 +80,9 @@ def main() -> None:
             "imageio missing. Install with: pip install imageio imageio-ffmpeg"
         ) from e
 
-    urdf_path = str(Path(args.urdf_path).expanduser().resolve())
+    urdf_path = Path(args.urdf_path).expanduser().resolve()
+    if not urdf_path.is_file():
+        raise FileNotFoundError(f"URDF not found: {urdf_path}")
     traj_path = Path(args.trajectory_npz).expanduser().resolve()
     out_path = Path(args.output_mp4).expanduser().resolve()
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -52,7 +94,9 @@ def main() -> None:
     if q_traj.ndim != 2:
         raise ValueError(f"q_selected must be (N,D), got {q_traj.shape}")
 
-    model = mujoco.MjModel.from_xml_path(urdf_path)
+    rewritten_urdf = _rewrite_urdf_package_paths(urdf_path)
+    print(f"[INFO] rewritten URDF for MuJoCo: {rewritten_urdf}")
+    model = mujoco.MjModel.from_xml_path(str(rewritten_urdf))
     mj_data = mujoco.MjData(model)
     renderer = mujoco.Renderer(model, width=args.width, height=args.height)
 
@@ -79,4 +123,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
