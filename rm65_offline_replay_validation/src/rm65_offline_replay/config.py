@@ -43,9 +43,20 @@ DEFAULT_CONFIG = {
         "w_local_rot": 0.4,
         "w_local_limit": 0.01,
         "w_local_sing": 0.01,
+        "w_local_center": 0.05,
+        "w_home": 0.10,
+        "w_start_home": 0.40,
+        "start_home_window": 30,
+        "home_q_deg": [0.0, -35.0, 75.0, 0.0, 50.0, 0.0],
         "w_transition_smooth": 0.3,
+        "w_transition_l2": 0.3,
+        "w_transition_linf": 0.4,
         "branch_jump_rad": 0.6,
         "branch_penalty": 2.0,
+        "hard_max_step_rad": 0.35,
+        "hard_step_penalty": 300.0,
+        "post_stabilize_passes": 2,
+        "post_stabilize_dq_scale": 0.9,
         "failed_candidate_penalty": 20.0,
     },
     "report": {
@@ -107,4 +118,3 @@ def transform_from_cfg(node: dict) -> np.ndarray:
     else:
         rpy = [0.0, 0.0, 0.0]
     return xyz_rpy_to_matrix(xyz, rpy)
-

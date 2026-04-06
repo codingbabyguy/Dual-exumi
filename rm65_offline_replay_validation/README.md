@@ -72,6 +72,8 @@ pip install -r requirements-server.txt
 - `frames.T_B_from_pose_frame`
 - `frames.T_pose_to_tcp`
 - `frames.T_flange_to_tcp`
+- `selection.home_q_deg`（标准初始位形，单位度）
+- `selection.hard_max_step_rad`（单步关节突变硬阈值）
 
 3. 执行离线验证
 

@@ -101,6 +101,39 @@ class PinocchioIKBatchSolver:
         margin = np.minimum(q - self.lower, self.upper - q)
         return float(np.min(margin))
 
+    def _resolve_home_q(self, cfg: dict) -> np.ndarray:
+        sel = cfg.get("selection", {})
+        home_q_rad = sel.get("home_q_rad", None)
+        home_q_deg = sel.get("home_q_deg", None)
+        if isinstance(home_q_rad, list) and len(home_q_rad) == self.nq:
+            home_q = np.asarray(home_q_rad, dtype=np.float64)
+            return self.clip_q(home_q)
+        if isinstance(home_q_deg, list) and len(home_q_deg) == self.nq:
+            home_q = np.deg2rad(np.asarray(home_q_deg, dtype=np.float64))
+            return self.clip_q(home_q)
+        return self.neutral.copy()
+
+    def _home_bias_cost(self, q: np.ndarray, frame_idx: int, cfg: dict, home_q: np.ndarray) -> float:
+        sel = cfg["selection"]
+        q = np.asarray(q, dtype=np.float64)
+        home_q = np.asarray(home_q, dtype=np.float64)
+        dist = float(np.linalg.norm(q - home_q))
+        w_home = float(sel.get("w_home", 0.0))
+        cost = w_home * dist
+        start_window = int(sel.get("start_home_window", 0))
+        w_start_home = float(sel.get("w_start_home", 0.0))
+        if start_window > 0 and frame_idx < start_window:
+            alpha = float(start_window - frame_idx) / float(start_window)
+            cost += w_start_home * alpha * dist
+        return float(cost)
+
+    def _center_cost(self, q: np.ndarray) -> float:
+        # Encourage mid-range joint posture to avoid living near limits.
+        center = 0.5 * (self.lower + self.upper)
+        half_span = 0.5 * np.maximum(self.upper - self.lower, 1e-6)
+        normed = (np.asarray(q, dtype=np.float64) - center) / half_span
+        return float(np.linalg.norm(normed) / np.sqrt(self.nq))
+
     def _ik_residual(
         self, q: np.ndarray, T_target: np.ndarray, pos_w: float = 1.0, rot_w: float = 1.0
     ) -> np.ndarray:
@@ -134,13 +167,15 @@ class PinocchioIKBatchSolver:
         ok = bool(pos_err_m <= pos_tol_m and rot_err_rad <= rot_tol_rad)
         return q_sol, ok, pos_err_m, rot_err_rad
 
-    def _make_local_cost(self, cand: IKCandidate, cfg: dict) -> float:
+    def _make_local_cost(self, cand: IKCandidate, cfg: dict, frame_idx: int, home_q: np.ndarray) -> float:
         sel = cfg["selection"]
         cost = 0.0
         cost += float(sel["w_local_pos"]) * cand.pos_err_m
         cost += float(sel["w_local_rot"]) * cand.rot_err_rad
         cost += float(sel["w_local_limit"]) / (cand.limit_margin_rad + 1e-6)
         cost += float(sel["w_local_sing"]) / (cand.sigma_min + 1e-6)
+        cost += float(sel.get("w_local_center", 0.0)) * self._center_cost(cand.q)
+        cost += self._home_bias_cost(cand.q, frame_idx=frame_idx, cfg=cfg, home_q=home_q)
         if not cand.success:
             cost += float(sel["failed_candidate_penalty"])
         return float(cost)
@@ -151,6 +186,8 @@ class PinocchioIKBatchSolver:
         q_prev: np.ndarray | None,
         rng: np.random.Generator,
         cfg: dict,
+        frame_idx: int,
+        home_q: np.ndarray,
     ) -> list[IKCandidate]:
         ik_cfg = cfg["ik"]
         max_nfev = int(ik_cfg["max_nfev"])
@@ -162,6 +199,10 @@ class PinocchioIKBatchSolver:
             seeds.append(np.asarray(q_prev, dtype=np.float64))
             seeds.append(self.clip_q(q_prev + rng.normal(scale=0.04, size=self.nq)))
             seeds.append(self.clip_q(q_prev + rng.normal(scale=0.08, size=self.nq)))
+        seeds.append(np.asarray(home_q, dtype=np.float64))
+        if frame_idx <= 3:
+            seeds.append(self.clip_q(home_q + rng.normal(scale=0.03, size=self.nq)))
+            seeds.append(self.clip_q(home_q + rng.normal(scale=0.06, size=self.nq)))
         seeds.append(self.neutral)
 
         n_random = int(ik_cfg["n_random_seeds"])
@@ -186,7 +227,7 @@ class PinocchioIKBatchSolver:
                 sigma_min=self.jacobian_sigma_min(q),
                 local_cost=0.0,
             )
-            cand.local_cost = self._make_local_cost(cand, cfg)
+            cand.local_cost = self._make_local_cost(cand, cfg, frame_idx=frame_idx, home_q=home_q)
             cands.append(cand)
 
         cands = _dedup_candidates(cands, tol_rad=float(ik_cfg["dedup_joint_tol_rad"]))
@@ -200,10 +241,123 @@ class PinocchioIKBatchSolver:
         dq = np.asarray(q_now - q_prev, dtype=np.float64)
         max_jump = float(np.max(np.abs(dq)))
         jump_flag = max_jump > float(sel["branch_jump_rad"])
-        cost = float(sel["w_transition_smooth"]) * float(np.linalg.norm(dq))
+        w_l2 = float(sel.get("w_transition_l2", sel.get("w_transition_smooth", 0.0)))
+        w_linf = float(sel.get("w_transition_linf", 0.0))
+        cost = w_l2 * float(np.linalg.norm(dq))
+        cost += w_linf * max_jump
+
+        hard_max_step = float(sel.get("hard_max_step_rad", 0.0))
+        if hard_max_step > 0.0 and max_jump > hard_max_step:
+            jump_flag = True
+            excess = max_jump - hard_max_step
+            cost += float(sel.get("hard_step_penalty", 200.0)) * (1.0 + excess / hard_max_step)
         if jump_flag:
             cost += float(sel["branch_penalty"])
         return cost, jump_flag
+
+    def _evaluate_sequence(
+        self, q_selected: np.ndarray, target_T_list: list[np.ndarray], cfg: dict, home_q: np.ndarray
+    ) -> dict[str, Any]:
+        ik_cfg = cfg["ik"]
+        pos_tol_m = float(ik_cfg["pos_tol_m"])
+        rot_tol_rad = float(np.deg2rad(ik_cfg["rot_tol_deg"]))
+
+        n = int(q_selected.shape[0])
+        success = np.zeros((n,), dtype=np.int32)
+        pos_err_m = np.zeros((n,), dtype=np.float64)
+        rot_err_rad = np.zeros((n,), dtype=np.float64)
+        limit_margin_rad = np.zeros((n,), dtype=np.float64)
+        sigma_min = np.zeros((n,), dtype=np.float64)
+        local_cost = np.zeros((n,), dtype=np.float64)
+
+        achieved_T: list[np.ndarray] = []
+        for i in range(n):
+            q = q_selected[i]
+            T_actual = self.fk_matrix(q)
+            achieved_T.append(T_actual)
+            p_err, r_err = pose_error_components(target_T_list[i], T_actual)
+            pos_err_m[i] = p_err
+            rot_err_rad[i] = r_err
+            limit_margin_rad[i] = self.limit_margin(q)
+            sigma_min[i] = self.jacobian_sigma_min(q)
+            success[i] = 1 if (p_err <= pos_tol_m and r_err <= rot_tol_rad) else 0
+            cand = IKCandidate(
+                q=q,
+                success=bool(success[i]),
+                pos_err_m=float(p_err),
+                rot_err_rad=float(r_err),
+                limit_margin_rad=float(limit_margin_rad[i]),
+                sigma_min=float(sigma_min[i]),
+                local_cost=0.0,
+            )
+            local_cost[i] = self._make_local_cost(cand, cfg, frame_idx=i, home_q=home_q)
+
+        branch_flags = np.zeros((n,), dtype=np.int32)
+        for i in range(1, n):
+            _, jump_flag = self._transition_cost(q_selected[i - 1], q_selected[i], cfg)
+            branch_flags[i] = 1 if jump_flag else 0
+        branch_count = int(np.sum(branch_flags))
+        achieved_pose7 = np.stack([matrix_to_pose7(T) for T in achieved_T], axis=0)
+        return {
+            "success": success,
+            "pos_err_m": pos_err_m,
+            "rot_err_rad": rot_err_rad,
+            "limit_margin_rad": limit_margin_rad,
+            "sigma_min": sigma_min,
+            "branch_flags": branch_flags,
+            "branch_count": branch_count,
+            "local_cost": local_cost,
+            "achieved_T": achieved_T,
+            "achieved_pose7": achieved_pose7,
+        }
+
+    def _post_stabilize(
+        self,
+        q_selected: np.ndarray,
+        target_T_list: list[np.ndarray],
+        cfg: dict,
+    ) -> tuple[np.ndarray, int]:
+        sel = cfg["selection"]
+        max_step = float(sel.get("hard_max_step_rad", 0.0))
+        passes = int(sel.get("post_stabilize_passes", 0))
+        if max_step <= 0.0 or passes <= 0:
+            return q_selected, 0
+
+        ik_cfg = cfg["ik"]
+        max_nfev = int(ik_cfg["max_nfev"])
+        pos_tol_m = float(ik_cfg["pos_tol_m"])
+        rot_tol_rad = float(np.deg2rad(ik_cfg["rot_tol_deg"]))
+        scale = float(sel.get("post_stabilize_dq_scale", 1.0))
+        scale = max(0.1, min(1.0, scale))
+
+        q_out = np.asarray(q_selected, dtype=np.float64).copy()
+        fix_count = 0
+        for _ in range(passes):
+            changed = False
+            for i in range(1, q_out.shape[0]):
+                dq = q_out[i] - q_out[i - 1]
+                old_jump = float(np.max(np.abs(dq)))
+                if old_jump <= max_step:
+                    continue
+                limited = np.clip(dq, -max_step * scale, max_step * scale)
+                q_seed = self.clip_q(q_out[i - 1] + limited)
+                q_new, ok, _, _ = self.solve_ik(
+                    T_target=target_T_list[i],
+                    q_seed=q_seed,
+                    max_nfev=max_nfev,
+                    pos_tol_m=pos_tol_m,
+                    rot_tol_rad=rot_tol_rad,
+                )
+                if not ok:
+                    continue
+                new_jump = float(np.max(np.abs(q_new - q_out[i - 1])))
+                if new_jump < old_jump:
+                    q_out[i] = q_new
+                    fix_count += 1
+                    changed = True
+            if not changed:
+                break
+        return q_out, fix_count
 
     def select_sequence(
         self, candidates_per_frame: list[list[IKCandidate]], cfg: dict
@@ -249,12 +403,20 @@ class PinocchioIKBatchSolver:
     def solve_sequence(self, target_T_list: list[np.ndarray], cfg: dict) -> dict[str, Any]:
         ik_seed = int(cfg["ik"]["random_seed"])
         rng = np.random.default_rng(ik_seed)
+        home_q = self._resolve_home_q(cfg)
 
         candidates_per_frame: list[list[IKCandidate]] = []
         q_prev: np.ndarray | None = None
         for i, T_target in enumerate(target_T_list):
             local_rng = np.random.default_rng(int(rng.integers(0, 2**31 - 1)) + i)
-            cands = self.generate_candidates(T_target, q_prev=q_prev, rng=local_rng, cfg=cfg)
+            cands = self.generate_candidates(
+                T_target,
+                q_prev=q_prev,
+                rng=local_rng,
+                cfg=cfg,
+                frame_idx=i,
+                home_q=home_q,
+            )
             if not cands:
                 # Defensive fallback, should rarely happen.
                 q_fb = self.neutral if q_prev is None else q_prev
@@ -274,29 +436,35 @@ class PinocchioIKBatchSolver:
             candidates_per_frame.append(cands)
 
         chosen, branch_count, branch_flags = self.select_sequence(candidates_per_frame, cfg)
-        q_selected = np.stack([c.q for c in chosen], axis=0)
-        success = np.array([1 if c.success else 0 for c in chosen], dtype=np.int32)
-        pos_err_m = np.array([c.pos_err_m for c in chosen], dtype=np.float64)
-        rot_err_rad = np.array([c.rot_err_rad for c in chosen], dtype=np.float64)
-        limit_margin_rad = np.array([c.limit_margin_rad for c in chosen], dtype=np.float64)
-        sigma_min = np.array([c.sigma_min for c in chosen], dtype=np.float64)
-        local_cost = np.array([c.local_cost for c in chosen], dtype=np.float64)
-
-        achieved_T = [self.fk_matrix(q) for q in q_selected]
-        achieved_pose7 = np.stack([matrix_to_pose7(T) for T in achieved_T], axis=0)
+        q_selected_raw = np.stack([c.q for c in chosen], axis=0)
+        q_selected, post_stabilize_fix_count = self._post_stabilize(
+            q_selected=q_selected_raw,
+            target_T_list=target_T_list,
+            cfg=cfg,
+        )
+        eval_out = self._evaluate_sequence(
+            q_selected=q_selected,
+            target_T_list=target_T_list,
+            cfg=cfg,
+            home_q=home_q,
+        )
 
         return {
             "q_selected": q_selected,
-            "success": success,
-            "pos_err_m": pos_err_m,
-            "rot_err_rad": rot_err_rad,
-            "limit_margin_rad": limit_margin_rad,
-            "sigma_min": sigma_min,
-            "branch_flags": branch_flags,
-            "branch_count": branch_count,
-            "local_cost": local_cost,
-            "achieved_T": achieved_T,
-            "achieved_pose7": achieved_pose7,
+            "q_selected_raw": q_selected_raw,
+            "post_stabilize_fix_count": int(post_stabilize_fix_count),
+            "success": eval_out["success"],
+            "pos_err_m": eval_out["pos_err_m"],
+            "rot_err_rad": eval_out["rot_err_rad"],
+            "limit_margin_rad": eval_out["limit_margin_rad"],
+            "sigma_min": eval_out["sigma_min"],
+            "branch_flags": eval_out["branch_flags"],
+            "branch_count": eval_out["branch_count"],
+            "branch_count_raw": int(branch_count),
+            "branch_flags_raw": branch_flags,
+            "local_cost": eval_out["local_cost"],
+            "achieved_T": eval_out["achieved_T"],
+            "achieved_pose7": eval_out["achieved_pose7"],
             "joint_names": self.joint_names,
+            "home_q_rad": home_q,
         }
-

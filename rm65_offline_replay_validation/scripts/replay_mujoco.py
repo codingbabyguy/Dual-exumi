@@ -137,7 +137,20 @@ def main() -> None:
     print(f"[INFO] rewritten URDF for MuJoCo: {rewritten_urdf}")
     model = mujoco.MjModel.from_xml_path(str(rewritten_urdf))
     mj_data = mujoco.MjData(model)
-    renderer = mujoco.Renderer(model, width=args.width, height=args.height)
+
+    # MuJoCo offscreen framebuffer defaults are often 640x480.
+    # Clamp requested render size to avoid Renderer init failure.
+    off_w = int(getattr(model.vis.global_, "offwidth", 640))
+    off_h = int(getattr(model.vis.global_, "offheight", 480))
+    render_w = min(int(args.width), off_w)
+    render_h = min(int(args.height), off_h)
+    if render_w != int(args.width) or render_h != int(args.height):
+        print(
+            f"[WARN] requested {args.width}x{args.height} exceeds offscreen "
+            f"{off_w}x{off_h}, fallback to {render_w}x{render_h}"
+        )
+
+    renderer = mujoco.Renderer(model, width=render_w, height=render_h)
 
     nq_model = int(model.nq)
     nq_traj = int(q_traj.shape[1])

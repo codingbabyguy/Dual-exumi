@@ -57,6 +57,7 @@ def save_demo_outputs(
     branch_flags: np.ndarray,
     local_cost: np.ndarray,
     joint_names: list[str],
+    q_selected_raw: np.ndarray | None = None,
 ) -> dict:
     out_dir = Path(out_dir).expanduser().resolve()
     demo_out = out_dir / demo_name
@@ -98,21 +99,23 @@ def save_demo_outputs(
             )
 
     npz_path = demo_out / "selected_trajectory.npz"
-    np.savez_compressed(
-        npz_path,
-        timestamps=timestamps.astype(np.float64),
-        target_tcp_pose7=target_tcp_pose7.astype(np.float64),
-        achieved_tcp_pose7=achieved_tcp_pose7.astype(np.float64),
-        q_selected=q_selected.astype(np.float64),
-        success=success.astype(np.int32),
-        limit_margin_rad=limit_margin_rad.astype(np.float64),
-        sigma_min=sigma_min.astype(np.float64),
-        pos_err_m=pos_err_m.astype(np.float64),
-        rot_err_rad=rot_err_rad.astype(np.float64),
-        branch_flags=branch_flags.astype(np.int32),
-        local_cost=local_cost.astype(np.float64),
-        joint_names=np.asarray(joint_names),
-    )
+    payload = {
+        "timestamps": timestamps.astype(np.float64),
+        "target_tcp_pose7": target_tcp_pose7.astype(np.float64),
+        "achieved_tcp_pose7": achieved_tcp_pose7.astype(np.float64),
+        "q_selected": q_selected.astype(np.float64),
+        "success": success.astype(np.int32),
+        "limit_margin_rad": limit_margin_rad.astype(np.float64),
+        "sigma_min": sigma_min.astype(np.float64),
+        "pos_err_m": pos_err_m.astype(np.float64),
+        "rot_err_rad": rot_err_rad.astype(np.float64),
+        "branch_flags": branch_flags.astype(np.int32),
+        "local_cost": local_cost.astype(np.float64),
+        "joint_names": np.asarray(joint_names),
+    }
+    if q_selected_raw is not None:
+        payload["q_selected_raw"] = q_selected_raw.astype(np.float64)
+    np.savez_compressed(npz_path, **payload)
 
     return {
         "demo_out": str(demo_out),
@@ -128,4 +131,3 @@ def save_global_summary(out_dir: str | Path, rows: list[dict]) -> str:
     with open(path, "w", encoding="utf-8") as f:
         json.dump(rows, f, indent=2, ensure_ascii=False)
     return str(path)
-

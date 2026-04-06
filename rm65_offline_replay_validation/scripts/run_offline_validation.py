@@ -135,6 +135,7 @@ def main() -> None:
         ik_out = solver.solve_sequence(target_solve_T, cfg)
 
         q_selected = ik_out["q_selected"]
+        q_selected_raw = ik_out.get("q_selected_raw", None)
         success = ik_out["success"]
         limit_margin_rad = ik_out["limit_margin_rad"]
         sigma_min = ik_out["sigma_min"]
@@ -180,6 +181,16 @@ def main() -> None:
                 "solve_frame": solve_frame,
             }
         )
+        if q_selected.shape[0] > 1:
+            dq = np.diff(q_selected, axis=0)
+            summary["joint_step_max_rad"] = float(np.max(np.abs(dq)))
+            summary["joint_step_mean_rad"] = float(np.mean(np.linalg.norm(dq, axis=1)))
+        else:
+            summary["joint_step_max_rad"] = 0.0
+            summary["joint_step_mean_rad"] = 0.0
+        summary["post_stabilize_fix_count"] = int(ik_out.get("post_stabilize_fix_count", 0))
+        summary["branch_switch_count_raw"] = int(ik_out.get("branch_count_raw", branch_count))
+        summary["home_q_rad"] = np.asarray(ik_out.get("home_q_rad", []), dtype=np.float64).tolist()
 
         rm_baseline = run_rm_baseline_ik(
             cfg=cfg,
@@ -207,6 +218,7 @@ def main() -> None:
             branch_flags=branch_flags,
             local_cost=local_cost,
             joint_names=ik_out["joint_names"],
+            q_selected_raw=q_selected_raw,
         )
         summary["artifacts"] = out_paths
 
@@ -225,4 +237,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
