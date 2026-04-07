@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 import sys
 from typing import Any
+import time
 
 import numpy as np
 from scipy.spatial.transform import Rotation as R
@@ -210,16 +211,20 @@ def main() -> None:
     args = parse_args()
     out_dir = Path(args.output_dir).expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
+    print(f"[INIT] output_dir={out_dir}", flush=True)
 
     cfg_base = load_config(args.config)
+    print(f"[INIT] loaded config={cfg_base.get('config_path', args.config)}", flush=True)
     urdf_path_path = Path(cfg_base["robot"]["urdf_path"]).expanduser().resolve()
     if not urdf_path_path.is_file():
         raise FileNotFoundError(
             f"robot.urdf_path must be a URDF file, got: {urdf_path_path}"
         )
     urdf_path = str(urdf_path_path)
+    print(f"[INIT] urdf_path={urdf_path}", flush=True)
     ee_frame_name = str(cfg_base["robot"]["ee_frame_name"])
     solver = PinocchioIKBatchSolver(urdf_path=urdf_path, ee_frame_name=ee_frame_name)
+    print(f"[INIT] pinocchio model loaded, nq={solver.nq}, ee_frame={ee_frame_name}", flush=True)
 
     demo_paths: list[Path]
     if args.demo_json:
@@ -232,8 +237,16 @@ def main() -> None:
     if len(demo_paths) == 0:
         raise RuntimeError("No demos found.")
     demo_paths = demo_paths[: max(1, int(args.max_demos))]
+    print(f"[DATA] using {len(demo_paths)} demo(s) for search:", flush=True)
+    for p in demo_paths:
+        print(f"[DATA] - {p}", flush=True)
 
     demos = [load_aligned_pose_json(p) for p in demo_paths]
+    for d in demos:
+        print(
+            f"[DATA] demo={d['demo_name']} frames={d['pose'].shape[0]} coordinate_frame={d.get('coordinate_frame','unknown')}",
+            flush=True,
+        )
 
     # Base parameter vector
     b_xyz0, b_rpy0 = _ensure_rpy_node(cfg_base["frames"]["T_B_from_pose_frame"])
@@ -243,9 +256,14 @@ def main() -> None:
         home0 = np.zeros((solver.nq,), dtype=np.float64)
 
     rng = np.random.default_rng(int(args.seed))
+    print(
+        f"[SEARCH] seed={args.seed} max_trials={args.max_trials} frame_stride={args.frame_stride} max_demos={args.max_demos}",
+        flush=True,
+    )
     history: list[dict[str, Any]] = []
     best_cfg = copy.deepcopy(cfg_base)
     best_metrics: dict[str, Any] | None = None
+    t0 = time.time()
 
     def sample_candidate(trial_idx: int) -> dict:
         cfg = copy.deepcopy(cfg_base)
@@ -294,7 +312,19 @@ def main() -> None:
 
         return cfg
 
-    for trial in range(int(args.max_trials)):
+    n_trials = int(args.max_trials)
+    for trial in range(n_trials):
+        trial_t0 = time.time()
+        if trial == 0:
+            print(f"[TRIAL {trial+1}/{n_trials}] baseline evaluation...", flush=True)
+        elif trial % 10 == 0:
+            elapsed = time.time() - t0
+            avg = elapsed / max(1, trial)
+            remain = avg * (n_trials - trial)
+            print(
+                f"[TRIAL {trial+1}/{n_trials}] running... elapsed={elapsed:.1f}s eta={remain:.1f}s",
+                flush=True,
+            )
         cfg_trial = sample_candidate(trial)
         rows = []
         for d in demos:
@@ -319,6 +349,7 @@ def main() -> None:
             "home_q_deg": cfg_trial["selection"].get("home_q_deg", None),
         }
         history.append(rec)
+        trial_dt = time.time() - trial_t0
 
         improved = best_metrics is None or float(agg["score"]) < float(best_metrics["score"])
         if improved:
@@ -329,7 +360,18 @@ def main() -> None:
                 f"near_limit={agg['near_limit_ratio']:.3f} "
                 f"branch={agg['branch_switch_count']:.1f} "
                 f"step_max={agg['joint_step_max_rad']:.3f} "
-                f"pos_err={agg['pos_err_mean']:.4f}"
+                f"pos_err={agg['pos_err_mean']:.4f} "
+                f"trial_time={trial_dt:.2f}s"
+            )
+        elif trial < 3:
+            # Show a few early non-best trials to confirm progress.
+            print(
+                f"[TRIAL {trial+1}/{n_trials}] score={agg['score']:.4f} "
+                f"near_limit={agg['near_limit_ratio']:.3f} "
+                f"branch={agg['branch_switch_count']:.1f} "
+                f"step_max={agg['joint_step_max_rad']:.3f} "
+                f"trial_time={trial_dt:.2f}s",
+                flush=True,
             )
 
     if best_metrics is None:
@@ -348,9 +390,15 @@ def main() -> None:
     best_cfg_to_save.pop("config_path", None)
     dump_yaml(best_cfg_path, best_cfg_to_save)
 
-    print(f"[DONE] best config: {best_cfg_path}")
-    print(f"[DONE] best metrics: {best_metrics_path}")
-    print(f"[DONE] history: {history_path}")
+    total_dt = time.time() - t0
+    print(f"[DONE] best config: {best_cfg_path}", flush=True)
+    print(f"[DONE] best metrics: {best_metrics_path}", flush=True)
+    print(f"[DONE] history: {history_path}", flush=True)
+    print(
+        f"[DONE] total_time={total_dt:.1f}s best_score={best_metrics['score']:.4f} "
+        f"near_limit={best_metrics['near_limit_ratio']:.3f} branch={best_metrics['branch_switch_count']:.1f}",
+        flush=True,
+    )
 
 
 if __name__ == "__main__":
