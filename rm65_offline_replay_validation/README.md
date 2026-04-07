@@ -153,3 +153,24 @@ export MUJOCO_GL=osmesa
 - `rm_baseline.rm_api_python_dir` 指向 `RM_API2/Python`
 
 若 SDK 依赖完整，主脚本会附带输出 RM baseline IK 的成功率对照。
+
+
+cd /home/icrlab/tactile_work_Wy/Dual-exumi/rm65_offline_replay_validation
+
+python scripts/optimize_mapping_params.py \
+  --config configs/rm65_default.yaml \
+  --session_dir /home/icrlab/tactile_work_Wy/data/grip_red/batch_3 \
+  --output_dir /home/icrlab/tactile_work_Wy/data/grip_red/batch_3/demos/optimize \
+  --max_trials 120 \
+  --frame_stride 2 \
+  --max_demos 2
+
+python scripts/run_offline_validation.py \
+  --config /home/icrlab/tactile_work_Wy/data/grip_red/batch_3/demos/optimize/best_config.yaml \
+  --session_dir /home/icrlab/tactile_work_Wy/data/grip_red/batch_3 \
+  --output_dir /home/icrlab/tactile_work_Wy/data/grip_red/batch_3/optimized_work
+
+python /home/icrlab/tactile_work_Wy/Dual-exumi/rm65_offline_replay_validation/scripts/replay_mujoco.py \
+  --urdf_path "/home/icrlab/tactile_work_Wy/Dual-exumi/RM-65/ROS/rm_65_robot/rm_65_description/urdf/rm_65_description.urdf" \
+  --trajectory_npz "/home/icrlab/tactile_work_Wy/data/grip_red/batch_3/optimized_work/demo_C3441130003646_2026.04.03_14.39.48.318421_seg026/selected_trajectory.npz" \
+  --output_mp4 "/home/icrlab/tactile_work_Wy/Dual-exumi/rm65_offline_replay_validation/trajectory_best.mp4"
