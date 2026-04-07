@@ -117,7 +117,12 @@ def main() -> None:
     if len(demo_paths) == 0:
         raise RuntimeError("No aligned_arcap_poses.json found.")
 
-    urdf_path = str(Path(cfg["robot"]["urdf_path"]).expanduser().resolve())
+    urdf_path_path = Path(cfg["robot"]["urdf_path"]).expanduser().resolve()
+    if not urdf_path_path.is_file():
+        raise FileNotFoundError(
+            f"robot.urdf_path must be a URDF file, got: {urdf_path_path}"
+        )
+    urdf_path = str(urdf_path_path)
     ee_frame_name = str(cfg["robot"]["ee_frame_name"])
     solver = PinocchioIKBatchSolver(urdf_path=urdf_path, ee_frame_name=ee_frame_name)
 

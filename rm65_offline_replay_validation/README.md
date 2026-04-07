@@ -15,6 +15,7 @@ rm65_offline_replay_validation/
     rm65_default.yaml
   scripts/
     run_offline_validation.py
+    optimize_mapping_params.py
     replay_mujoco.py
   src/rm65_offline_replay/
     config.py
@@ -93,6 +94,32 @@ python scripts/run_offline_validation.py \
 
 全局汇总：
 - `global_summary.json`
+
+4.5 参数搜索（推荐先做）
+
+```bash
+python scripts/optimize_mapping_params.py \
+  --config configs/rm65_default.yaml \
+  --session_dir <你的session目录> \
+  --output_dir <优化输出目录> \
+  --max_trials 120 \
+  --frame_stride 2 \
+  --max_demos 2
+```
+
+优化输出：
+- `best_config.yaml`（可直接用于 run_offline_validation）
+- `best_metrics.json`
+- `search_history.json`
+
+然后用最优配置重跑：
+
+```bash
+python scripts/run_offline_validation.py \
+  --config <优化输出目录>/best_config.yaml \
+  --session_dir <你的session目录> \
+  --output_dir <验证输出目录>
+```
 
 5. MuJoCo 回放（可选）
 
