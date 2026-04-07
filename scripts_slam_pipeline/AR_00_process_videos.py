@@ -217,12 +217,25 @@ def _segment_video_by_intervals(mp4_path, output_dir, cam_serial, start_ts, inte
         frame_intervals.append((item, idx, seg_start, seg_end, start_frame, end_frame))
 
     created = []
+    reserved_demo_names = set()
     for item, idx, seg_start, seg_end, start_frame, end_frame in frame_intervals:
         out_dname = f"demo_{cam_serial}_{_time_to_str(seg_start)}"
+        if out_dname in reserved_demo_names:
+            print(
+                f"[WARN] Skip duplicate interval#{idx} for {mp4_path.name}: "
+                f"same start timestamp as an already generated episode ({out_dname})."
+            )
+            continue
         this_out_dir = output_dir.joinpath(out_dname)
         if this_out_dir.exists():
-            this_out_dir = output_dir.joinpath(f"{out_dname}_seg{idx:03d}")
+            print(
+                f"[WARN] Skip interval#{idx} for {mp4_path.name}: "
+                f"episode dir already exists ({this_out_dir.name}), "
+                "will not generate *_segXXX fallback."
+            )
+            continue
         this_out_dir.mkdir(parents=True, exist_ok=True)
+        reserved_demo_names.add(out_dname)
 
         out_video_path = this_out_dir.joinpath("raw_video.mp4")
         writer = cv2.VideoWriter(
