@@ -71,6 +71,11 @@ def build_targets(
     cfg: dict,
 ) -> tuple[list[np.ndarray], list[np.ndarray]]:
     frames_cfg = cfg["frames"]
+    input_pose_represents = str(cfg["robot"].get("input_pose_represents", "tcp")).strip().lower()
+    if input_pose_represents not in {"tcp", "flange"}:
+        raise ValueError(
+            f"robot.input_pose_represents must be tcp|flange, got {input_pose_represents}"
+        )
     solve_frame = str(cfg["robot"]["solve_frame"]).strip().lower()
     if solve_frame not in {"flange", "tcp"}:
         raise ValueError(f"robot.solve_frame must be flange|tcp, got {solve_frame}")
@@ -78,15 +83,20 @@ def build_targets(
     T_B_from_pose = transform_from_cfg(frames_cfg["T_B_from_pose_frame"])
     T_pose_to_tcp = transform_from_cfg(frames_cfg["T_pose_to_tcp"])
     T_flange_to_tcp = transform_from_cfg(frames_cfg["T_flange_to_tcp"])
-    T_tcp_to_flange = transform_inverse(T_flange_to_tcp)
+    T_pose_to_flange = transform_inverse(T_flange_to_tcp)
 
     target_solve_T: list[np.ndarray] = []
     target_tcp_T: list[np.ndarray] = []
     for i in range(pose_arr.shape[0]):
         T_pose = pose7_to_matrix(pose_arr[i])
-        T_B_tcp = compose(compose(T_B_from_pose, T_pose), T_pose_to_tcp)
+        if input_pose_represents == "flange":
+            T_B_flange = compose(T_B_from_pose, T_pose)
+            T_B_tcp = compose(T_B_flange, T_flange_to_tcp)
+        else:
+            T_B_tcp = compose(compose(T_B_from_pose, T_pose), T_pose_to_tcp)
+            T_B_flange = compose(T_B_tcp, T_pose_to_flange)
         if solve_frame == "flange":
-            T_B_solve = compose(T_B_tcp, T_tcp_to_flange)
+            T_B_solve = T_B_flange
         else:
             T_B_solve = T_B_tcp
         target_solve_T.append(T_B_solve)
@@ -148,6 +158,10 @@ def summarize_one_demo(
         "rot_err_deg_mean": float(np.rad2deg(np.mean(rot_err))),
         "rot_err_deg_max": float(np.rad2deg(np.max(rot_err))),
         "post_stabilize_fix_count": int(ik_out.get("post_stabilize_fix_count", 0)),
+        "wrist_flip_count": int(ik_out.get("wrist_flip_count", 0)),
+        "joint_pref_violation_ratio": float(ik_out.get("joint_pref_violation_ratio", 0.0)),
+        "elbow_sign_violation_ratio": float(ik_out.get("elbow_sign_violation_ratio", 0.0)),
+        "elbow_halfspace_violation_ratio": float(ik_out.get("elbow_halfspace_violation_ratio", 0.0)),
     }
     return out
 
@@ -161,6 +175,10 @@ def score_metrics(m: dict[str, Any]) -> float:
     score += 2.0 * min(float(m["joint_step_max_rad"]) / 0.35, 2.0)
     score += 4.0 * (1.0 - float(m["success_rate"]))
     score += 6.0 * min(float(m["pos_err_mean"]) / 0.03, 3.0)
+    score += 1.2 * min(float(m.get("wrist_flip_count", 0.0)) / 4.0, 2.0)
+    score += 2.0 * float(m.get("joint_pref_violation_ratio", 0.0))
+    score += 1.0 * float(m.get("elbow_sign_violation_ratio", 0.0))
+    score += 2.5 * float(m.get("elbow_halfspace_violation_ratio", 0.0))
     # bonus penalty if still fully hugging limit
     if float(m["limit_margin_min"]) < 0.005:
         score += 2.0
@@ -182,11 +200,15 @@ def aggregate_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "rot_err_deg_mean",
         "rot_err_deg_max",
         "post_stabilize_fix_count",
+        "wrist_flip_count",
+        "joint_pref_violation_ratio",
+        "elbow_sign_violation_ratio",
+        "elbow_halfspace_violation_ratio",
     ]
     out: dict[str, Any] = {}
     for k in keys:
         vals = np.asarray([float(r[k]) for r in rows], dtype=np.float64)
-        if k in {"branch_switch_count", "post_stabilize_fix_count"}:
+        if k in {"branch_switch_count", "post_stabilize_fix_count", "wrist_flip_count"}:
             out[k] = float(np.sum(vals))
         elif k in {"limit_margin_min", "sigma_min_min"}:
             out[k] = float(np.min(vals))
@@ -223,8 +245,10 @@ def main() -> None:
     urdf_path = str(urdf_path_path)
     print(f"[INIT] urdf_path={urdf_path}", flush=True)
     ee_frame_name = str(cfg_base["robot"]["ee_frame_name"])
+    input_pose_represents = str(cfg_base["robot"].get("input_pose_represents", "tcp")).strip().lower()
     solver = PinocchioIKBatchSolver(urdf_path=urdf_path, ee_frame_name=ee_frame_name)
     print(f"[INIT] pinocchio model loaded, nq={solver.nq}, ee_frame={ee_frame_name}", flush=True)
+    print(f"[INIT] input_pose_represents={input_pose_represents} solve_frame={cfg_base['robot']['solve_frame']}", flush=True)
 
     demo_paths: list[Path]
     if args.demo_json:
@@ -302,7 +326,8 @@ def main() -> None:
         )
 
         cfg["frames"]["T_B_from_pose_frame"] = _set_xyz_rpy(cfg["frames"]["T_B_from_pose_frame"], b_xyz, b_rpy)
-        cfg["frames"]["T_pose_to_tcp"] = _set_xyz_rpy(cfg["frames"]["T_pose_to_tcp"], p_xyz, p_rpy)
+        if input_pose_represents != "flange":
+            cfg["frames"]["T_pose_to_tcp"] = _set_xyz_rpy(cfg["frames"]["T_pose_to_tcp"], p_xyz, p_rpy)
 
         if args.optimize_home_q:
             home = home_c + rng.uniform(
@@ -359,6 +384,8 @@ def main() -> None:
                 f"[BEST] trial={trial} score={agg['score']:.4f} "
                 f"near_limit={agg['near_limit_ratio']:.3f} "
                 f"branch={agg['branch_switch_count']:.1f} "
+                f"wrist_flip={agg['wrist_flip_count']:.1f} "
+                f"elbow_hs={agg['elbow_halfspace_violation_ratio']:.3f} "
                 f"step_max={agg['joint_step_max_rad']:.3f} "
                 f"pos_err={agg['pos_err_mean']:.4f} "
                 f"trial_time={trial_dt:.2f}s"
@@ -369,6 +396,7 @@ def main() -> None:
                 f"[TRIAL {trial+1}/{n_trials}] score={agg['score']:.4f} "
                 f"near_limit={agg['near_limit_ratio']:.3f} "
                 f"branch={agg['branch_switch_count']:.1f} "
+                f"wrist_flip={agg['wrist_flip_count']:.1f} "
                 f"step_max={agg['joint_step_max_rad']:.3f} "
                 f"trial_time={trial_dt:.2f}s",
                 flush=True,
@@ -396,7 +424,10 @@ def main() -> None:
     print(f"[DONE] history: {history_path}", flush=True)
     print(
         f"[DONE] total_time={total_dt:.1f}s best_score={best_metrics['score']:.4f} "
-        f"near_limit={best_metrics['near_limit_ratio']:.3f} branch={best_metrics['branch_switch_count']:.1f}",
+        f"near_limit={best_metrics['near_limit_ratio']:.3f} "
+        f"branch={best_metrics['branch_switch_count']:.1f} "
+        f"wrist_flip={best_metrics.get('wrist_flip_count', 0.0):.1f} "
+        f"elbow_hs={best_metrics.get('elbow_halfspace_violation_ratio', 0.0):.3f}",
         flush=True,
     )
 

@@ -58,6 +58,10 @@ def save_demo_outputs(
     local_cost: np.ndarray,
     joint_names: list[str],
     q_selected_raw: np.ndarray | None = None,
+    wrist_flip_flags: np.ndarray | None = None,
+    joint_pref_violation: np.ndarray | None = None,
+    elbow_sign_violation: np.ndarray | None = None,
+    elbow_halfspace_violation: np.ndarray | None = None,
 ) -> dict:
     out_dir = Path(out_dir).expanduser().resolve()
     demo_out = out_dir / demo_name
@@ -80,9 +84,21 @@ def save_demo_outputs(
                 "pos_err_m",
                 "rot_err_deg",
                 "branch_jump",
+                "wrist_flip",
+                "joint_pref_violation",
+                "elbow_sign_violation",
+                "elbow_halfspace_violation",
                 "local_cost",
             ]
         )
+        if wrist_flip_flags is None:
+            wrist_flip_flags = np.zeros_like(success, dtype=np.int32)
+        if joint_pref_violation is None:
+            joint_pref_violation = np.zeros_like(success, dtype=np.int32)
+        if elbow_sign_violation is None:
+            elbow_sign_violation = np.zeros_like(success, dtype=np.int32)
+        if elbow_halfspace_violation is None:
+            elbow_halfspace_violation = np.zeros_like(success, dtype=np.int32)
         for i in range(len(timestamps)):
             writer.writerow(
                 [
@@ -94,6 +110,10 @@ def save_demo_outputs(
                     float(pos_err_m[i]),
                     float(np.rad2deg(rot_err_rad[i])),
                     int(branch_flags[i]),
+                    int(wrist_flip_flags[i]),
+                    int(joint_pref_violation[i]),
+                    int(elbow_sign_violation[i]),
+                    int(elbow_halfspace_violation[i]),
                     float(local_cost[i]),
                 ]
             )
@@ -110,6 +130,10 @@ def save_demo_outputs(
         "pos_err_m": pos_err_m.astype(np.float64),
         "rot_err_rad": rot_err_rad.astype(np.float64),
         "branch_flags": branch_flags.astype(np.int32),
+        "wrist_flip_flags": np.asarray(wrist_flip_flags, dtype=np.int32),
+        "joint_pref_violation": np.asarray(joint_pref_violation, dtype=np.int32),
+        "elbow_sign_violation": np.asarray(elbow_sign_violation, dtype=np.int32),
+        "elbow_halfspace_violation": np.asarray(elbow_halfspace_violation, dtype=np.int32),
         "local_cost": local_cost.astype(np.float64),
         "joint_names": np.asarray(joint_names),
     }

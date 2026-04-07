@@ -2,6 +2,9 @@ robot:
   urdf_path: "/home/icrlab/tactile_work_Wy/Dual-exumi/RM-65/ROS/rm_65_robot/rm_65_description/urdf/rm_65_description.urdf"
   ee_frame_name: "Link6"
   solve_frame: "flange"
+  # Your collection is flange pose in manual_relative_frame.
+  # Set to "flange" to build IK target directly for flange.
+  input_pose_represents: "flange"
 
 frames:
   # B(base) <- pose_frame(manual_relative_frame by default in AR_03)
@@ -50,6 +53,40 @@ selection:
   post_stabilize_passes: 2
   post_stabilize_dq_scale: 0.9
   failed_candidate_penalty: 20.0
+
+  # ---- shape prior for "C-shape" preference ----
+  # Soft preference ranges (deg) for each joint [min, max].
+  # Keep null to disable per-joint range prior.
+  w_shape_joint_range: 0.35
+  joint_preferred_ranges_deg:
+    - [-170.0, 170.0]
+    - [-120.0, -5.0]
+    - [25.0, 130.0]
+    - [-170.0, 170.0]
+    - [15.0, 145.0]
+    - [-170.0, 170.0]
+
+  # Elbow direction prior on one joint angle sign.
+  w_elbow_sign: 0.25
+  elbow_joint_index: 2
+  elbow_preferred_sign: 1.0
+  elbow_sign_deadband_rad: 0.05
+
+  # Elbow workspace half-space prior using elbow frame position.
+  # signed = preferred_sign * (dot(normal, p_elbow) + offset)
+  # cost only when signed < 0.
+  w_elbow_halfspace: 0.40
+  elbow_frame_name: "Link3"
+  elbow_halfspace_normal_xyz: [0.0, 0.0, 1.0]
+  elbow_halfspace_offset_m: -0.02
+  elbow_halfspace_preferred_sign: 1.0
+  elbow_halfspace_scale_m: 0.10
+
+  # Wrist-flip prior (transition penalty on wrist joints).
+  w_wrist_flip: 0.80
+  wrist_joint_indices: [4, 5]
+  wrist_flip_step_threshold_rad: 0.75
+  wrist_flip_sign_epsilon_rad: 0.15
 
 report:
   near_limit_threshold_rad: 0.08

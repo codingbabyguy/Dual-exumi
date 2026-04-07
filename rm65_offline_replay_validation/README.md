@@ -49,6 +49,10 @@ rm65_offline_replay_validation/
 - `T_pose_to_tcp`: 输入位姿 -> 策略TCP
 - `T_flange_to_tcp`: 法兰 -> TCP（默认填了 RM-65 flange xacro 值）
 
+`robot.input_pose_represents`：
+- `tcp`：输入pose就是TCP
+- `flange`：输入pose就是法兰（你的数据通常是这个）
+
 主流程内部使用：
 - `T_B_tcp = T_B_from_pose_frame * T_pose * T_pose_to_tcp`
 - 若 `solve_frame=flange`，则求解目标为 `T_B_flange = T_B_tcp * inv(T_flange_to_tcp)`
@@ -70,11 +74,13 @@ pip install -r requirements-server.txt
 至少确认：
 - `robot.urdf_path`
 - `robot.ee_frame_name`
+- `robot.input_pose_represents`（若采集的是法兰pose，设为 `flange`）
 - `frames.T_B_from_pose_frame`
 - `frames.T_pose_to_tcp`
 - `frames.T_flange_to_tcp`
 - `selection.home_q_deg`（标准初始位形，单位度）
 - `selection.hard_max_step_rad`（单步关节突变硬阈值）
+- `selection.w_shape_joint_range / w_elbow_sign / w_elbow_halfspace / w_wrist_flip`（姿态先验）
 
 3. 执行离线验证
 

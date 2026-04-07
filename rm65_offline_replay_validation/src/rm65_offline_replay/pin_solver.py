@@ -56,6 +56,7 @@ class PinocchioIKBatchSolver:
         self.upper = np.asarray(self.model.upperPositionLimit, dtype=np.float64).copy()
         self.neutral = np.asarray(pin.neutral(self.model), dtype=np.float64).copy()
         self.joint_names = self._extract_joint_names()
+        self._frame_id_cache: dict[str, int] = {}
 
     def _extract_joint_names(self) -> list[str]:
         # Universe joint is index 0 in pinocchio.
@@ -83,6 +84,28 @@ class PinocchioIKBatchSolver:
         T[:3, :3] = oMf.rotation
         T[:3, 3] = oMf.translation
         return T
+
+    def _get_frame_id(self, frame_name: str) -> int | None:
+        key = str(frame_name).strip()
+        if len(key) == 0:
+            return None
+        cached = self._frame_id_cache.get(key, None)
+        if cached is not None:
+            return cached
+        fid = self.model.getFrameId(key)
+        if fid >= len(self.model.frames):
+            return None
+        self._frame_id_cache[key] = int(fid)
+        return int(fid)
+
+    def frame_translation(self, q: np.ndarray, frame_name: str) -> np.ndarray | None:
+        fid = self._get_frame_id(frame_name)
+        if fid is None:
+            return None
+        q = np.asarray(q, dtype=np.float64)
+        self.pin.forwardKinematics(self.model, self.data, q)
+        self.pin.updateFramePlacement(self.model, self.data, fid)
+        return np.asarray(self.data.oMf[fid].translation, dtype=np.float64).copy()
 
     def jacobian_sigma_min(self, q: np.ndarray) -> float:
         q = np.asarray(q, dtype=np.float64)
@@ -134,6 +157,131 @@ class PinocchioIKBatchSolver:
         normed = (np.asarray(q, dtype=np.float64) - center) / half_span
         return float(np.linalg.norm(normed) / np.sqrt(self.nq))
 
+    def _normalize_joint_index(self, idx_raw: Any) -> int | None:
+        try:
+            idx = int(idx_raw)
+        except (TypeError, ValueError):
+            return None
+        if idx < 0:
+            idx += self.nq
+        if idx < 0 or idx >= self.nq:
+            return None
+        return idx
+
+    def _joint_range_prior_cost(self, q: np.ndarray, cfg: dict) -> tuple[float, bool]:
+        sel = cfg.get("selection", {})
+        ranges = sel.get("joint_preferred_ranges_deg", None)
+        if not isinstance(ranges, list):
+            return 0.0, False
+        q = np.asarray(q, dtype=np.float64)
+        acc = 0.0
+        used = 0
+        violated = False
+        for i in range(min(self.nq, len(ranges))):
+            item = ranges[i]
+            if item is None:
+                continue
+            if isinstance(item, dict):
+                lo_deg = item.get("min_deg", item.get("min", None))
+                hi_deg = item.get("max_deg", item.get("max", None))
+            elif isinstance(item, (list, tuple)) and len(item) >= 2:
+                lo_deg, hi_deg = item[0], item[1]
+            else:
+                continue
+            try:
+                lo = float(np.deg2rad(float(lo_deg)))
+                hi = float(np.deg2rad(float(hi_deg)))
+            except (TypeError, ValueError):
+                continue
+            if hi < lo:
+                lo, hi = hi, lo
+            span = max(hi - lo, 1e-6)
+            qi = float(q[i])
+            if qi < lo:
+                v = (lo - qi) / span
+                violated = True
+            elif qi > hi:
+                v = (qi - hi) / span
+                violated = True
+            else:
+                v = 0.0
+            acc += v * v
+            used += 1
+        if used <= 0:
+            return 0.0, False
+        return float(acc / used), violated
+
+    def _elbow_sign_cost(self, q: np.ndarray, cfg: dict) -> tuple[float, bool]:
+        sel = cfg.get("selection", {})
+        idx = self._normalize_joint_index(sel.get("elbow_joint_index", 2))
+        if idx is None:
+            return 0.0, False
+        pref = 1.0 if float(sel.get("elbow_preferred_sign", 1.0)) >= 0.0 else -1.0
+        deadband = max(float(sel.get("elbow_sign_deadband_rad", 0.0)), 0.0)
+        signed = pref * float(np.asarray(q, dtype=np.float64)[idx])
+        if signed >= deadband:
+            return 0.0, False
+        viol = deadband - signed
+        scale = np.pi
+        cost = (viol / scale) ** 2
+        return float(cost), bool(signed < 0.0)
+
+    def _elbow_halfspace_cost(self, q: np.ndarray, cfg: dict) -> tuple[float, bool]:
+        sel = cfg.get("selection", {})
+        frame_name = str(sel.get("elbow_frame_name", "")).strip()
+        if len(frame_name) == 0:
+            return 0.0, False
+        p_elbow = self.frame_translation(q=q, frame_name=frame_name)
+        if p_elbow is None:
+            return 0.0, False
+        normal = np.asarray(sel.get("elbow_halfspace_normal_xyz", [0.0, 0.0, 1.0]), dtype=np.float64)
+        if normal.shape != (3,):
+            return 0.0, False
+        n_norm = float(np.linalg.norm(normal))
+        if n_norm < 1e-12:
+            return 0.0, False
+        normal = normal / n_norm
+        offset = float(sel.get("elbow_halfspace_offset_m", 0.0))
+        pref = 1.0 if float(sel.get("elbow_halfspace_preferred_sign", 1.0)) >= 0.0 else -1.0
+        signed = pref * (float(np.dot(normal, p_elbow)) + offset)
+        if signed >= 0.0:
+            return 0.0, False
+        viol_m = -signed
+        scale_m = max(float(sel.get("elbow_halfspace_scale_m", 0.10)), 1e-4)
+        cost = (viol_m / scale_m) ** 2
+        return float(cost), True
+
+    def _wrist_flip_transition_cost(
+        self,
+        q_prev: np.ndarray,
+        q_now: np.ndarray,
+        cfg: dict,
+    ) -> tuple[float, bool]:
+        sel = cfg.get("selection", {})
+        idx_list = sel.get("wrist_joint_indices", [-2, -1])
+        if not isinstance(idx_list, list):
+            idx_list = [idx_list]
+        step_th = max(float(sel.get("wrist_flip_step_threshold_rad", 0.8)), 1e-6)
+        sign_eps = max(float(sel.get("wrist_flip_sign_epsilon_rad", 0.15)), 0.0)
+        q_prev = np.asarray(q_prev, dtype=np.float64)
+        q_now = np.asarray(q_now, dtype=np.float64)
+        raw = 0.0
+        flagged = False
+        for idx_raw in idx_list:
+            idx = self._normalize_joint_index(idx_raw)
+            if idx is None:
+                continue
+            a = float(q_prev[idx])
+            b = float(q_now[idx])
+            dq = abs(b - a)
+            if dq > step_th:
+                raw += (dq - step_th) / step_th
+                flagged = True
+            if abs(a) > sign_eps and abs(b) > sign_eps and (a * b < 0.0):
+                raw += 1.0
+                flagged = True
+        return float(raw), flagged
+
     def _ik_residual(
         self, q: np.ndarray, T_target: np.ndarray, pos_w: float = 1.0, rot_w: float = 1.0
     ) -> np.ndarray:
@@ -176,6 +324,18 @@ class PinocchioIKBatchSolver:
         cost += float(sel["w_local_sing"]) / (cand.sigma_min + 1e-6)
         cost += float(sel.get("w_local_center", 0.0)) * self._center_cost(cand.q)
         cost += self._home_bias_cost(cand.q, frame_idx=frame_idx, cfg=cfg, home_q=home_q)
+        w_shape_joint_range = float(sel.get("w_shape_joint_range", 0.0))
+        if w_shape_joint_range > 0.0:
+            shape_cost, _ = self._joint_range_prior_cost(cand.q, cfg)
+            cost += w_shape_joint_range * shape_cost
+        w_elbow_sign = float(sel.get("w_elbow_sign", 0.0))
+        if w_elbow_sign > 0.0:
+            elbow_sign_cost, _ = self._elbow_sign_cost(cand.q, cfg)
+            cost += w_elbow_sign * elbow_sign_cost
+        w_elbow_halfspace = float(sel.get("w_elbow_halfspace", 0.0))
+        if w_elbow_halfspace > 0.0:
+            elbow_halfspace_cost, _ = self._elbow_halfspace_cost(cand.q, cfg)
+            cost += w_elbow_halfspace * elbow_halfspace_cost
         if not cand.success:
             cost += float(sel["failed_candidate_penalty"])
         return float(cost)
@@ -236,15 +396,23 @@ class PinocchioIKBatchSolver:
         cands = cands[:max_keep]
         return cands
 
-    def _transition_cost(self, q_prev: np.ndarray, q_now: np.ndarray, cfg: dict) -> tuple[float, bool]:
+    def _transition_cost(self, q_prev: np.ndarray, q_now: np.ndarray, cfg: dict) -> tuple[float, bool, bool]:
         sel = cfg["selection"]
         dq = np.asarray(q_now - q_prev, dtype=np.float64)
         max_jump = float(np.max(np.abs(dq)))
         jump_flag = max_jump > float(sel["branch_jump_rad"])
+        wrist_flip_flag = False
         w_l2 = float(sel.get("w_transition_l2", sel.get("w_transition_smooth", 0.0)))
         w_linf = float(sel.get("w_transition_linf", 0.0))
         cost = w_l2 * float(np.linalg.norm(dq))
         cost += w_linf * max_jump
+
+        w_wrist_flip = float(sel.get("w_wrist_flip", 0.0))
+        if w_wrist_flip > 0.0:
+            wrist_raw_cost, wrist_flip_flag = self._wrist_flip_transition_cost(q_prev=q_prev, q_now=q_now, cfg=cfg)
+            cost += w_wrist_flip * wrist_raw_cost
+            if wrist_flip_flag:
+                jump_flag = True
 
         hard_max_step = float(sel.get("hard_max_step_rad", 0.0))
         if hard_max_step > 0.0 and max_jump > hard_max_step:
@@ -253,7 +421,7 @@ class PinocchioIKBatchSolver:
             cost += float(sel.get("hard_step_penalty", 200.0)) * (1.0 + excess / hard_max_step)
         if jump_flag:
             cost += float(sel["branch_penalty"])
-        return cost, jump_flag
+        return cost, jump_flag, wrist_flip_flag
 
     def _evaluate_sequence(
         self, q_selected: np.ndarray, target_T_list: list[np.ndarray], cfg: dict, home_q: np.ndarray
@@ -269,6 +437,12 @@ class PinocchioIKBatchSolver:
         limit_margin_rad = np.zeros((n,), dtype=np.float64)
         sigma_min = np.zeros((n,), dtype=np.float64)
         local_cost = np.zeros((n,), dtype=np.float64)
+        joint_pref_cost = np.zeros((n,), dtype=np.float64)
+        elbow_sign_cost = np.zeros((n,), dtype=np.float64)
+        elbow_halfspace_cost = np.zeros((n,), dtype=np.float64)
+        joint_pref_violation = np.zeros((n,), dtype=np.int32)
+        elbow_sign_violation = np.zeros((n,), dtype=np.int32)
+        elbow_halfspace_violation = np.zeros((n,), dtype=np.int32)
 
         achieved_T: list[np.ndarray] = []
         for i in range(n):
@@ -291,12 +465,24 @@ class PinocchioIKBatchSolver:
                 local_cost=0.0,
             )
             local_cost[i] = self._make_local_cost(cand, cfg, frame_idx=i, home_q=home_q)
+            shape_cost_i, shape_bad_i = self._joint_range_prior_cost(q, cfg)
+            elbow_sign_cost_i, elbow_sign_bad_i = self._elbow_sign_cost(q, cfg)
+            elbow_hs_cost_i, elbow_hs_bad_i = self._elbow_halfspace_cost(q, cfg)
+            joint_pref_cost[i] = shape_cost_i
+            elbow_sign_cost[i] = elbow_sign_cost_i
+            elbow_halfspace_cost[i] = elbow_hs_cost_i
+            joint_pref_violation[i] = 1 if shape_bad_i else 0
+            elbow_sign_violation[i] = 1 if elbow_sign_bad_i else 0
+            elbow_halfspace_violation[i] = 1 if elbow_hs_bad_i else 0
 
         branch_flags = np.zeros((n,), dtype=np.int32)
+        wrist_flip_flags = np.zeros((n,), dtype=np.int32)
         for i in range(1, n):
-            _, jump_flag = self._transition_cost(q_selected[i - 1], q_selected[i], cfg)
+            _, jump_flag, wrist_flip_flag = self._transition_cost(q_selected[i - 1], q_selected[i], cfg)
             branch_flags[i] = 1 if jump_flag else 0
+            wrist_flip_flags[i] = 1 if wrist_flip_flag else 0
         branch_count = int(np.sum(branch_flags))
+        wrist_flip_count = int(np.sum(wrist_flip_flags))
         achieved_pose7 = np.stack([matrix_to_pose7(T) for T in achieved_T], axis=0)
         return {
             "success": success,
@@ -307,6 +493,17 @@ class PinocchioIKBatchSolver:
             "branch_flags": branch_flags,
             "branch_count": branch_count,
             "local_cost": local_cost,
+            "wrist_flip_flags": wrist_flip_flags,
+            "wrist_flip_count": wrist_flip_count,
+            "joint_pref_cost": joint_pref_cost,
+            "joint_pref_violation": joint_pref_violation,
+            "joint_pref_violation_ratio": float(np.mean(joint_pref_violation)) if n > 0 else 0.0,
+            "elbow_sign_cost": elbow_sign_cost,
+            "elbow_sign_violation": elbow_sign_violation,
+            "elbow_sign_violation_ratio": float(np.mean(elbow_sign_violation)) if n > 0 else 0.0,
+            "elbow_halfspace_cost": elbow_halfspace_cost,
+            "elbow_halfspace_violation": elbow_halfspace_violation,
+            "elbow_halfspace_violation_ratio": float(np.mean(elbow_halfspace_violation)) if n > 0 else 0.0,
             "achieved_T": achieved_T,
             "achieved_pose7": achieved_pose7,
         }
@@ -375,7 +572,7 @@ class PinocchioIKBatchSolver:
             trans = np.zeros((len(prev), len(cur)), dtype=np.float64)
             for p_idx, p in enumerate(prev):
                 for c_idx, c in enumerate(cur):
-                    t_cost, _ = self._transition_cost(p.q, c.q, cfg)
+                    t_cost, _, _ = self._transition_cost(p.q, c.q, cfg)
                     trans[p_idx, c_idx] = t_cost
 
             total = dp_prev[:, None] + trans + np.array([c.local_cost for c in cur])[None, :]
@@ -395,7 +592,7 @@ class PinocchioIKBatchSolver:
 
         branch_flags = np.zeros((n,), dtype=np.int32)
         for i in range(1, n):
-            _, jump_flag = self._transition_cost(chosen[i - 1].q, chosen[i].q, cfg)
+            _, jump_flag, _ = self._transition_cost(chosen[i - 1].q, chosen[i].q, cfg)
             branch_flags[i] = 1 if jump_flag else 0
         branch_count = int(np.sum(branch_flags))
         return chosen, branch_count, branch_flags
@@ -462,6 +659,17 @@ class PinocchioIKBatchSolver:
             "branch_count": eval_out["branch_count"],
             "branch_count_raw": int(branch_count),
             "branch_flags_raw": branch_flags,
+            "wrist_flip_flags": eval_out["wrist_flip_flags"],
+            "wrist_flip_count": int(eval_out["wrist_flip_count"]),
+            "joint_pref_cost": eval_out["joint_pref_cost"],
+            "joint_pref_violation": eval_out["joint_pref_violation"],
+            "joint_pref_violation_ratio": float(eval_out["joint_pref_violation_ratio"]),
+            "elbow_sign_cost": eval_out["elbow_sign_cost"],
+            "elbow_sign_violation": eval_out["elbow_sign_violation"],
+            "elbow_sign_violation_ratio": float(eval_out["elbow_sign_violation_ratio"]),
+            "elbow_halfspace_cost": eval_out["elbow_halfspace_cost"],
+            "elbow_halfspace_violation": eval_out["elbow_halfspace_violation"],
+            "elbow_halfspace_violation_ratio": float(eval_out["elbow_halfspace_violation_ratio"]),
             "local_cost": eval_out["local_cost"],
             "achieved_T": eval_out["achieved_T"],
             "achieved_pose7": eval_out["achieved_pose7"],

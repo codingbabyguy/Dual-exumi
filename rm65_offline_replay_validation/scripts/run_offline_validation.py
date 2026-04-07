@@ -73,6 +73,11 @@ def build_targets(
     - target_tcp_pose7: (N,7)
     """
     frames_cfg = cfg["frames"]
+    input_pose_represents = str(cfg["robot"].get("input_pose_represents", "tcp")).strip().lower()
+    if input_pose_represents not in {"tcp", "flange"}:
+        raise ValueError(
+            f"robot.input_pose_represents must be tcp|flange, got {input_pose_represents}"
+        )
     solve_frame = str(cfg["robot"]["solve_frame"]).strip().lower()
     if solve_frame not in {"flange", "tcp"}:
         raise ValueError(f"robot.solve_frame must be flange|tcp, got {solve_frame}")
@@ -80,16 +85,21 @@ def build_targets(
     T_B_from_pose = transform_from_cfg(frames_cfg["T_B_from_pose_frame"])
     T_pose_to_tcp = transform_from_cfg(frames_cfg["T_pose_to_tcp"])
     T_flange_to_tcp = transform_from_cfg(frames_cfg["T_flange_to_tcp"])
-    T_tcp_to_flange = transform_inverse(T_flange_to_tcp)
+    T_pose_to_flange = transform_inverse(T_flange_to_tcp)
 
     target_solve_T: list[np.ndarray] = []
     target_tcp_T: list[np.ndarray] = []
 
     for i in range(pose_arr.shape[0]):
         T_pose = pose7_to_matrix(pose_arr[i])
-        T_B_tcp = compose(compose(T_B_from_pose, T_pose), T_pose_to_tcp)
+        if input_pose_represents == "flange":
+            T_B_flange = compose(T_B_from_pose, T_pose)
+            T_B_tcp = compose(T_B_flange, T_flange_to_tcp)
+        else:
+            T_B_tcp = compose(compose(T_B_from_pose, T_pose), T_pose_to_tcp)
+            T_B_flange = compose(T_B_tcp, T_pose_to_flange)
         if solve_frame == "flange":
-            T_B_solve = compose(T_B_tcp, T_tcp_to_flange)
+            T_B_solve = T_B_flange
         else:
             T_B_solve = T_B_tcp
         target_solve_T.append(T_B_solve)
@@ -127,7 +137,9 @@ def main() -> None:
     solver = PinocchioIKBatchSolver(urdf_path=urdf_path, ee_frame_name=ee_frame_name)
 
     solve_frame = str(cfg["robot"]["solve_frame"]).strip().lower()
+    input_pose_represents = str(cfg["robot"].get("input_pose_represents", "tcp")).strip().lower()
     T_flange_to_tcp = transform_from_cfg(cfg["frames"]["T_flange_to_tcp"])
+    print(f"[INIT] solve_frame={solve_frame} input_pose_represents={input_pose_represents}")
 
     global_rows: list[dict] = []
     for demo_json in demo_paths:
@@ -195,6 +207,10 @@ def main() -> None:
             summary["joint_step_mean_rad"] = 0.0
         summary["post_stabilize_fix_count"] = int(ik_out.get("post_stabilize_fix_count", 0))
         summary["branch_switch_count_raw"] = int(ik_out.get("branch_count_raw", branch_count))
+        summary["wrist_flip_count"] = int(ik_out.get("wrist_flip_count", 0))
+        summary["joint_pref_violation_ratio"] = float(ik_out.get("joint_pref_violation_ratio", 0.0))
+        summary["elbow_sign_violation_ratio"] = float(ik_out.get("elbow_sign_violation_ratio", 0.0))
+        summary["elbow_halfspace_violation_ratio"] = float(ik_out.get("elbow_halfspace_violation_ratio", 0.0))
         summary["home_q_rad"] = np.asarray(ik_out.get("home_q_rad", []), dtype=np.float64).tolist()
 
         rm_baseline = run_rm_baseline_ik(
@@ -224,12 +240,18 @@ def main() -> None:
             local_cost=local_cost,
             joint_names=ik_out["joint_names"],
             q_selected_raw=q_selected_raw,
+            wrist_flip_flags=ik_out.get("wrist_flip_flags", None),
+            joint_pref_violation=ik_out.get("joint_pref_violation", None),
+            elbow_sign_violation=ik_out.get("elbow_sign_violation", None),
+            elbow_halfspace_violation=ik_out.get("elbow_halfspace_violation", None),
         )
         summary["artifacts"] = out_paths
 
         print(
             f"[DONE] {demo_name}: success_rate={summary['success_rate']:.3f}, "
             f"branch={summary['branch_switch_count']}, "
+            f"wrist_flip={summary['wrist_flip_count']}, "
+            f"elbow_hs_bad={summary['elbow_halfspace_violation_ratio']:.3f}, "
             f"limit_min={summary['limit_margin_rad_min']:.4f} rad, "
             f"sigma_min={summary['sigma_min_min']:.5f}"
         )

@@ -13,6 +13,7 @@ DEFAULT_CONFIG = {
         "urdf_path": "",
         "ee_frame_name": "Link6",
         "solve_frame": "flange",  # flange | tcp
+        "input_pose_represents": "tcp",  # tcp | flange
     },
     "frames": {
         "T_B_from_pose_frame": {
@@ -58,6 +59,25 @@ DEFAULT_CONFIG = {
         "post_stabilize_passes": 2,
         "post_stabilize_dq_scale": 0.9,
         "failed_candidate_penalty": 20.0,
+        # Shape prior (all optional, weight=0 means disabled)
+        "w_shape_joint_range": 0.0,
+        # list length=nq, each item can be [min_deg, max_deg] or null
+        "joint_preferred_ranges_deg": None,
+        "w_elbow_sign": 0.0,
+        "elbow_joint_index": 2,
+        "elbow_preferred_sign": 1.0,
+        "elbow_sign_deadband_rad": 0.05,
+        "w_elbow_halfspace": 0.0,
+        "elbow_frame_name": "Link3",
+        "elbow_halfspace_normal_xyz": [0.0, 0.0, 1.0],
+        "elbow_halfspace_offset_m": 0.0,
+        "elbow_halfspace_preferred_sign": 1.0,
+        "elbow_halfspace_scale_m": 0.10,
+        "w_wrist_flip": 0.0,
+        # Supports negative index, e.g. [-2, -1] means last two joints.
+        "wrist_joint_indices": [-2, -1],
+        "wrist_flip_step_threshold_rad": 0.8,
+        "wrist_flip_sign_epsilon_rad": 0.15,
     },
     "report": {
         "near_limit_threshold_rad": 0.08,
