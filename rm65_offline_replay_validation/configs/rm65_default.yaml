@@ -39,7 +39,8 @@ selection:
   w_local_limit: 0.01
   w_local_sing: 0.01
   w_local_center: 0.05
-  w_home: 0.10
+  w_home: 0.20
+  home_quadratic_gain: 1.5
   w_start_home: 0.40
   start_home_window: 30
   home_q_deg: [0.0, -35.0, 75.0, 0.0, 50.0, 0.0]
@@ -87,6 +88,13 @@ selection:
   wrist_joint_indices: [4, 5]
   wrist_flip_step_threshold_rad: 0.75
   wrist_flip_sign_epsilon_rad: 0.15
+
+  # Extra strict prior for joint3: keep near home and in a tighter range.
+  w_joint3_strict: 0.90
+  joint3_index: 2
+  joint3_home_deadband_deg: 6.0
+  joint3_home_scale_deg: 16.0
+  joint3_strict_range_deg: [35.0, 120.0]
 
 report:
   near_limit_threshold_rad: 0.08

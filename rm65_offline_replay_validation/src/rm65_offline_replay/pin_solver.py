@@ -141,13 +141,15 @@ class PinocchioIKBatchSolver:
         q = np.asarray(q, dtype=np.float64)
         home_q = np.asarray(home_q, dtype=np.float64)
         dist = float(np.linalg.norm(q - home_q))
+        quad_gain = float(sel.get("home_quadratic_gain", 1.0))
+        dist_term = dist + quad_gain * dist * dist
         w_home = float(sel.get("w_home", 0.0))
-        cost = w_home * dist
+        cost = w_home * dist_term
         start_window = int(sel.get("start_home_window", 0))
         w_start_home = float(sel.get("w_start_home", 0.0))
         if start_window > 0 and frame_idx < start_window:
             alpha = float(start_window - frame_idx) / float(start_window)
-            cost += w_start_home * alpha * dist
+            cost += w_start_home * alpha * dist_term
         return float(cost)
 
     def _center_cost(self, q: np.ndarray) -> float:
@@ -251,6 +253,62 @@ class PinocchioIKBatchSolver:
         cost = (viol_m / scale_m) ** 2
         return float(cost), True
 
+    def _joint3_strict_cost(self, q: np.ndarray, cfg: dict, home_q: np.ndarray) -> tuple[float, bool]:
+        sel = cfg.get("selection", {})
+        idx = self._normalize_joint_index(sel.get("joint3_index", 2))
+        if idx is None:
+            return 0.0, False
+        q = np.asarray(q, dtype=np.float64)
+        home_q = np.asarray(home_q, dtype=np.float64)
+        q_deg = float(np.rad2deg(q[idx]))
+        home_deg = float(np.rad2deg(home_q[idx]))
+
+        # 1) strict preferred range for joint3
+        strict_range = sel.get("joint3_strict_range_deg", None)
+        lo_deg = None
+        hi_deg = None
+        if isinstance(strict_range, (list, tuple)) and len(strict_range) >= 2:
+            lo_deg, hi_deg = strict_range[0], strict_range[1]
+        elif isinstance(strict_range, dict):
+            lo_deg = strict_range.get("min_deg", strict_range.get("min", None))
+            hi_deg = strict_range.get("max_deg", strict_range.get("max", None))
+        if lo_deg is None or hi_deg is None:
+            ranges = sel.get("joint_preferred_ranges_deg", None)
+            if isinstance(ranges, list) and idx < len(ranges):
+                item = ranges[idx]
+                if isinstance(item, (list, tuple)) and len(item) >= 2:
+                    lo_deg, hi_deg = item[0], item[1]
+                elif isinstance(item, dict):
+                    lo_deg = item.get("min_deg", item.get("min", None))
+                    hi_deg = item.get("max_deg", item.get("max", None))
+
+        range_cost = 0.0
+        range_bad = False
+        if lo_deg is not None and hi_deg is not None:
+            lo = float(lo_deg)
+            hi = float(hi_deg)
+            if hi < lo:
+                lo, hi = hi, lo
+            span = max(hi - lo, 1e-6)
+            if q_deg < lo:
+                range_cost = ((lo - q_deg) / span) ** 2
+                range_bad = True
+            elif q_deg > hi:
+                range_cost = ((q_deg - hi) / span) ** 2
+                range_bad = True
+
+        # 2) distance-to-home on joint3 with deadband
+        deadband = max(float(sel.get("joint3_home_deadband_deg", 0.0)), 0.0)
+        scale = max(float(sel.get("joint3_home_scale_deg", 20.0)), 1e-6)
+        err = abs(q_deg - home_deg)
+        home_cost = 0.0
+        home_bad = False
+        if err > deadband:
+            home_cost = ((err - deadband) / scale) ** 2
+            home_bad = True
+
+        return float(range_cost + home_cost), bool(range_bad or home_bad)
+
     def _wrist_flip_transition_cost(
         self,
         q_prev: np.ndarray,
@@ -336,6 +394,10 @@ class PinocchioIKBatchSolver:
         if w_elbow_halfspace > 0.0:
             elbow_halfspace_cost, _ = self._elbow_halfspace_cost(cand.q, cfg)
             cost += w_elbow_halfspace * elbow_halfspace_cost
+        w_joint3_strict = float(sel.get("w_joint3_strict", 0.0))
+        if w_joint3_strict > 0.0:
+            joint3_cost, _ = self._joint3_strict_cost(cand.q, cfg, home_q=home_q)
+            cost += w_joint3_strict * joint3_cost
         if not cand.success:
             cost += float(sel["failed_candidate_penalty"])
         return float(cost)
@@ -440,9 +502,11 @@ class PinocchioIKBatchSolver:
         joint_pref_cost = np.zeros((n,), dtype=np.float64)
         elbow_sign_cost = np.zeros((n,), dtype=np.float64)
         elbow_halfspace_cost = np.zeros((n,), dtype=np.float64)
+        joint3_strict_cost = np.zeros((n,), dtype=np.float64)
         joint_pref_violation = np.zeros((n,), dtype=np.int32)
         elbow_sign_violation = np.zeros((n,), dtype=np.int32)
         elbow_halfspace_violation = np.zeros((n,), dtype=np.int32)
+        joint3_strict_violation = np.zeros((n,), dtype=np.int32)
 
         achieved_T: list[np.ndarray] = []
         for i in range(n):
@@ -468,12 +532,15 @@ class PinocchioIKBatchSolver:
             shape_cost_i, shape_bad_i = self._joint_range_prior_cost(q, cfg)
             elbow_sign_cost_i, elbow_sign_bad_i = self._elbow_sign_cost(q, cfg)
             elbow_hs_cost_i, elbow_hs_bad_i = self._elbow_halfspace_cost(q, cfg)
+            joint3_cost_i, joint3_bad_i = self._joint3_strict_cost(q, cfg, home_q=home_q)
             joint_pref_cost[i] = shape_cost_i
             elbow_sign_cost[i] = elbow_sign_cost_i
             elbow_halfspace_cost[i] = elbow_hs_cost_i
+            joint3_strict_cost[i] = joint3_cost_i
             joint_pref_violation[i] = 1 if shape_bad_i else 0
             elbow_sign_violation[i] = 1 if elbow_sign_bad_i else 0
             elbow_halfspace_violation[i] = 1 if elbow_hs_bad_i else 0
+            joint3_strict_violation[i] = 1 if joint3_bad_i else 0
 
         branch_flags = np.zeros((n,), dtype=np.int32)
         wrist_flip_flags = np.zeros((n,), dtype=np.int32)
@@ -504,6 +571,9 @@ class PinocchioIKBatchSolver:
             "elbow_halfspace_cost": elbow_halfspace_cost,
             "elbow_halfspace_violation": elbow_halfspace_violation,
             "elbow_halfspace_violation_ratio": float(np.mean(elbow_halfspace_violation)) if n > 0 else 0.0,
+            "joint3_strict_cost": joint3_strict_cost,
+            "joint3_strict_violation": joint3_strict_violation,
+            "joint3_strict_violation_ratio": float(np.mean(joint3_strict_violation)) if n > 0 else 0.0,
             "achieved_T": achieved_T,
             "achieved_pose7": achieved_pose7,
         }
@@ -670,6 +740,9 @@ class PinocchioIKBatchSolver:
             "elbow_halfspace_cost": eval_out["elbow_halfspace_cost"],
             "elbow_halfspace_violation": eval_out["elbow_halfspace_violation"],
             "elbow_halfspace_violation_ratio": float(eval_out["elbow_halfspace_violation_ratio"]),
+            "joint3_strict_cost": eval_out["joint3_strict_cost"],
+            "joint3_strict_violation": eval_out["joint3_strict_violation"],
+            "joint3_strict_violation_ratio": float(eval_out["joint3_strict_violation_ratio"]),
             "local_cost": eval_out["local_cost"],
             "achieved_T": eval_out["achieved_T"],
             "achieved_pose7": eval_out["achieved_pose7"],

@@ -49,6 +49,35 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--search_pose_tcp_rpy_deg", type=float, default=30.0, help="Search half-range for T_pose_to_tcp rpy.")
     parser.add_argument("--search_home_deg", type=float, default=15.0, help="Search half-range for home_q_deg.")
     parser.add_argument("--optimize_home_q", action="store_true", help="Enable search over home_q_deg.")
+    parser.add_argument(
+        "--presearch_scalar_steps",
+        type=int,
+        default=9,
+        help="Grid steps for each scalar stage of T_B_from_pose_frame presearch.",
+    )
+    parser.add_argument(
+        "--presearch_rp_steps",
+        type=int,
+        default=5,
+        help="Grid steps per axis for roll/pitch presearch stage.",
+    )
+    parser.add_argument(
+        "--presearch_fine_scale",
+        type=float,
+        default=0.35,
+        help="Fine-stage span scale after coarse T_B_from_pose_frame presearch.",
+    )
+    parser.add_argument(
+        "--presearch_frame_window",
+        type=int,
+        default=12,
+        help="First-N-frame window used to judge comfortable starting workspace.",
+    )
+    parser.add_argument(
+        "--auto_continue",
+        action="store_true",
+        help="Skip interactive yes-confirmation after base-frame presearch.",
+    )
     return parser.parse_args()
 
 
@@ -64,6 +93,18 @@ def _set_xyz_rpy(node: dict, xyz: np.ndarray, rpy_rad: np.ndarray) -> dict:
         "xyz": [float(x) for x in xyz.tolist()],
         "rpy_rad": [float(x) for x in rpy_rad.tolist()],
     }
+
+
+def _normalize_joint_index(idx_raw: Any, nq: int) -> int | None:
+    try:
+        idx = int(idx_raw)
+    except (TypeError, ValueError):
+        return None
+    if idx < 0:
+        idx += int(nq)
+    if idx < 0 or idx >= int(nq):
+        return None
+    return int(idx)
 
 
 def build_targets(
@@ -110,6 +151,7 @@ def summarize_one_demo(
     pose_arr: np.ndarray,
     ts: np.ndarray,
     frame_stride: int,
+    focus_window: int,
 ) -> dict[str, Any]:
     if frame_stride > 1:
         pose_arr = pose_arr[::frame_stride]
@@ -124,6 +166,10 @@ def summarize_one_demo(
     sigma_min = ik_out["sigma_min"]
     branch_count = int(ik_out["branch_count"])
     joint_step_max = float(np.max(np.abs(np.diff(q, axis=0)))) if len(q) > 1 else 0.0
+    home_q = np.asarray(ik_out.get("home_q_rad", np.zeros((solver.nq,), dtype=np.float64)), dtype=np.float64)
+    q_dist_home = np.linalg.norm(q - home_q[None, :], axis=1) if len(q) > 0 else np.zeros((0,), dtype=np.float64)
+    early_n = max(1, min(int(focus_window), int(len(q)))) if len(q) > 0 else 0
+    early_slice = slice(0, early_n)
 
     solve_frame = str(cfg["robot"]["solve_frame"]).strip().lower()
     T_flange_to_tcp = transform_from_cfg(cfg["frames"]["T_flange_to_tcp"])
@@ -142,6 +188,26 @@ def summarize_one_demo(
 
     near_limit_th = float(cfg["report"]["near_limit_threshold_rad"])
     near_sing_th = float(cfg["report"]["near_singular_threshold"])
+    elbow_sign_violation = np.asarray(ik_out.get("elbow_sign_violation", np.zeros_like(success)), dtype=np.float64)
+    elbow_halfspace_violation = np.asarray(
+        ik_out.get("elbow_halfspace_violation", np.zeros_like(success)),
+        dtype=np.float64,
+    )
+    joint3_strict_violation = np.asarray(
+        ik_out.get("joint3_strict_violation", np.zeros_like(success)),
+        dtype=np.float64,
+    )
+    wrist_flip_flags = np.asarray(ik_out.get("wrist_flip_flags", np.zeros_like(success)), dtype=np.float64)
+    branch_flags = np.asarray(ik_out.get("branch_flags", np.zeros_like(success)), dtype=np.float64)
+
+    joint3_idx = _normalize_joint_index(cfg.get("selection", {}).get("joint3_index", 2), solver.nq)
+    if joint3_idx is None or len(q) == 0:
+        joint3_margin = np.zeros((len(q),), dtype=np.float64)
+    else:
+        joint3_margin = np.minimum(
+            q[:, joint3_idx] - solver.lower[joint3_idx],
+            solver.upper[joint3_idx] - q[:, joint3_idx],
+        )
 
     out = {
         "n_frames": int(len(ts)),
@@ -162,6 +228,18 @@ def summarize_one_demo(
         "joint_pref_violation_ratio": float(ik_out.get("joint_pref_violation_ratio", 0.0)),
         "elbow_sign_violation_ratio": float(ik_out.get("elbow_sign_violation_ratio", 0.0)),
         "elbow_halfspace_violation_ratio": float(ik_out.get("elbow_halfspace_violation_ratio", 0.0)),
+        "joint3_strict_violation_ratio": float(ik_out.get("joint3_strict_violation_ratio", 0.0)),
+        "first_frame_home_dist_rad": float(q_dist_home[0]) if len(q_dist_home) > 0 else 0.0,
+        "early_home_mean_rad": float(np.mean(q_dist_home[early_slice])) if early_n > 0 else 0.0,
+        "first_frame_limit_margin": float(limit_margin[0]) if len(limit_margin) > 0 else 0.0,
+        "first_frame_sigma_min": float(sigma_min[0]) if len(sigma_min) > 0 else 0.0,
+        "joint3_margin_min": float(np.min(joint3_margin)) if len(joint3_margin) > 0 else 0.0,
+        "early_joint3_margin_min": float(np.min(joint3_margin[early_slice])) if early_n > 0 else 0.0,
+        "early_elbow_sign_violation_ratio": float(np.mean(elbow_sign_violation[early_slice])) if early_n > 0 else 0.0,
+        "early_elbow_halfspace_violation_ratio": float(np.mean(elbow_halfspace_violation[early_slice])) if early_n > 0 else 0.0,
+        "early_joint3_strict_violation_ratio": float(np.mean(joint3_strict_violation[early_slice])) if early_n > 0 else 0.0,
+        "early_wrist_flip_count": float(np.sum(wrist_flip_flags[early_slice])) if early_n > 0 else 0.0,
+        "early_branch_count": float(np.sum(branch_flags[early_slice])) if early_n > 0 else 0.0,
     }
     return out
 
@@ -179,9 +257,37 @@ def score_metrics(m: dict[str, Any]) -> float:
     score += 2.0 * float(m.get("joint_pref_violation_ratio", 0.0))
     score += 1.0 * float(m.get("elbow_sign_violation_ratio", 0.0))
     score += 2.5 * float(m.get("elbow_halfspace_violation_ratio", 0.0))
+    score += 3.0 * float(m.get("joint3_strict_violation_ratio", 0.0))
     # bonus penalty if still fully hugging limit
     if float(m["limit_margin_min"]) < 0.005:
         score += 2.0
+    return float(score)
+
+
+def score_workspace_metrics(m: dict[str, Any]) -> float:
+    # Lower is better. Prioritize "comfortable working region" before later fine tuning.
+    score = 0.0
+    score += 4.5 * min(float(m.get("first_frame_home_dist_rad", 0.0)) / 0.60, 3.0)
+    score += 2.5 * min(float(m.get("early_home_mean_rad", 0.0)) / 0.75, 3.0)
+
+    early_joint3_margin = float(m.get("early_joint3_margin_min", 0.0))
+    all_joint3_margin = float(m.get("joint3_margin_min", 0.0))
+    score += 4.0 * max(0.0, (0.35 - early_joint3_margin) / 0.35)
+    score += 2.0 * max(0.0, (0.25 - all_joint3_margin) / 0.25)
+
+    score += 2.0 * max(0.0, (0.06 - float(m.get("first_frame_limit_margin", 0.0))) / 0.06)
+    score += 2.0 * max(0.0, (0.025 - float(m.get("first_frame_sigma_min", 0.0))) / 0.025)
+
+    score += 2.0 * float(m.get("early_elbow_sign_violation_ratio", 0.0))
+    score += 3.5 * float(m.get("early_elbow_halfspace_violation_ratio", 0.0))
+    score += 2.0 * float(m.get("early_joint3_strict_violation_ratio", 0.0))
+    score += 1.5 * min(float(m.get("early_wrist_flip_count", 0.0)) / 2.0, 3.0)
+    score += 1.0 * min(float(m.get("early_branch_count", 0.0)) / 2.0, 3.0)
+
+    score += 5.0 * float(m.get("near_limit_ratio", 0.0))
+    score += 5.0 * float(m.get("near_singular_ratio", 0.0))
+    score += 3.0 * (1.0 - float(m.get("success_rate", 0.0)))
+    score += 2.0 * min(float(m.get("pos_err_mean", 0.0)) / 0.03, 3.0)
     return float(score)
 
 
@@ -204,19 +310,32 @@ def aggregate_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "joint_pref_violation_ratio",
         "elbow_sign_violation_ratio",
         "elbow_halfspace_violation_ratio",
+        "joint3_strict_violation_ratio",
+        "first_frame_home_dist_rad",
+        "early_home_mean_rad",
+        "first_frame_limit_margin",
+        "first_frame_sigma_min",
+        "joint3_margin_min",
+        "early_joint3_margin_min",
+        "early_elbow_sign_violation_ratio",
+        "early_elbow_halfspace_violation_ratio",
+        "early_joint3_strict_violation_ratio",
+        "early_wrist_flip_count",
+        "early_branch_count",
     ]
     out: dict[str, Any] = {}
     for k in keys:
         vals = np.asarray([float(r[k]) for r in rows], dtype=np.float64)
-        if k in {"branch_switch_count", "post_stabilize_fix_count", "wrist_flip_count"}:
+        if k in {"branch_switch_count", "post_stabilize_fix_count", "wrist_flip_count", "early_wrist_flip_count", "early_branch_count"}:
             out[k] = float(np.sum(vals))
-        elif k in {"limit_margin_min", "sigma_min_min"}:
+        elif k in {"limit_margin_min", "sigma_min_min", "joint3_margin_min", "early_joint3_margin_min", "first_frame_limit_margin", "first_frame_sigma_min"}:
             out[k] = float(np.min(vals))
         elif k in {"joint_step_max_rad", "pos_err_max", "rot_err_deg_max"}:
             out[k] = float(np.max(vals))
         else:
             out[k] = float(np.mean(vals))
     out["score"] = score_metrics(out)
+    out["workspace_score"] = score_workspace_metrics(out)
     return out
 
 
@@ -227,6 +346,241 @@ def dump_yaml(path: Path, obj: dict) -> None:
         raise RuntimeError("PyYAML required: pip install pyyaml") from e
     with open(path, "w", encoding="utf-8") as f:
         yaml.safe_dump(obj, f, sort_keys=False, allow_unicode=True)
+
+
+def evaluate_cfg_on_demos(
+    solver: PinocchioIKBatchSolver,
+    cfg: dict,
+    demos: list[dict[str, Any]],
+    frame_stride: int,
+    focus_window: int,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for d in demos:
+        m = summarize_one_demo(
+            solver=solver,
+            cfg=cfg,
+            pose_arr=d["pose"],
+            ts=d["timestamp"],
+            frame_stride=frame_stride,
+            focus_window=focus_window,
+        )
+        m["demo_name"] = d["demo_name"]
+        rows.append(m)
+    agg = aggregate_metrics(rows)
+    return rows, agg
+
+
+def _with_base_frame(cfg: dict, xyz: np.ndarray, rpy: np.ndarray) -> dict:
+    out = copy.deepcopy(cfg)
+    out["frames"]["T_B_from_pose_frame"] = _set_xyz_rpy(out["frames"]["T_B_from_pose_frame"], xyz, rpy)
+    return out
+
+
+def _record_trial(
+    history: list[dict[str, Any]],
+    phase: str,
+    trial_idx: int,
+    cfg_trial: dict,
+    agg: dict[str, Any],
+    rows: list[dict[str, Any]],
+    extra: dict[str, Any] | None = None,
+) -> None:
+    rec = {
+        "phase": phase,
+        "trial": int(trial_idx),
+        "metrics": agg,
+        "per_demo": rows,
+        "frames": {
+            "T_B_from_pose_frame": cfg_trial["frames"]["T_B_from_pose_frame"],
+            "T_pose_to_tcp": cfg_trial["frames"]["T_pose_to_tcp"],
+        },
+        "home_q_deg": cfg_trial["selection"].get("home_q_deg", None),
+    }
+    if extra:
+        rec.update(extra)
+    history.append(rec)
+
+
+def run_base_frame_presearch(
+    solver: PinocchioIKBatchSolver,
+    cfg_start: dict,
+    demos: list[dict[str, Any]],
+    frame_stride: int,
+    focus_window: int,
+    args: argparse.Namespace,
+) -> tuple[dict, dict[str, Any], list[dict[str, Any]]]:
+    history: list[dict[str, Any]] = []
+    trial_idx = 0
+
+    rows, best_metrics = evaluate_cfg_on_demos(
+        solver=solver,
+        cfg=cfg_start,
+        demos=demos,
+        frame_stride=frame_stride,
+        focus_window=focus_window,
+    )
+    best_cfg = copy.deepcopy(cfg_start)
+    _record_trial(
+        history,
+        phase="presearch_baseline",
+        trial_idx=trial_idx,
+        cfg_trial=best_cfg,
+        agg=best_metrics,
+        rows=rows,
+        extra={"stage": "baseline"},
+    )
+    trial_idx += 1
+    print(
+        f"[PRESEARCH] baseline workspace_score={best_metrics['workspace_score']:.4f} "
+        f"first_home={best_metrics['first_frame_home_dist_rad']:.3f} "
+        f"joint3_margin={best_metrics['joint3_margin_min']:.3f} "
+        f"near_limit={best_metrics['near_limit_ratio']:.3f} "
+        f"near_sing={best_metrics['near_singular_ratio']:.3f}",
+        flush=True,
+    )
+
+    scalar_steps = max(3, int(args.presearch_scalar_steps))
+    rp_steps = max(3, int(args.presearch_rp_steps))
+    fine_scale = max(0.05, min(float(args.presearch_fine_scale), 1.0))
+    axis_order = [
+        ("yaw", "rpy", 2, float(np.deg2rad(args.search_b_rpy_deg))),
+        ("x", "xyz", 0, float(args.search_b_xyz_m)),
+        ("z", "xyz", 2, float(args.search_b_xyz_m)),
+        ("y", "xyz", 1, float(args.search_b_xyz_m)),
+    ]
+
+    for axis_name, kind, idx, full_span in axis_order:
+        for pass_name, span_scale in [("coarse", 1.0), ("fine", fine_scale)]:
+            center_xyz, center_rpy = _ensure_rpy_node(best_cfg["frames"]["T_B_from_pose_frame"])
+            offsets = np.linspace(-full_span * span_scale, full_span * span_scale, scalar_steps, dtype=np.float64)
+            pass_best_cfg = best_cfg
+            pass_best_metrics = best_metrics
+            improved = False
+            print(
+                f"[PRESEARCH] stage={axis_name} pass={pass_name} center={center_xyz[idx] if kind == 'xyz' else center_rpy[idx]:.4f} span={full_span * span_scale:.4f}",
+                flush=True,
+            )
+            for offset in offsets:
+                xyz = center_xyz.copy()
+                rpy = center_rpy.copy()
+                if kind == "xyz":
+                    xyz[idx] = center_xyz[idx] + float(offset)
+                else:
+                    rpy[idx] = center_rpy[idx] + float(offset)
+                cfg_trial = _with_base_frame(best_cfg, xyz=xyz, rpy=rpy)
+                rows, agg = evaluate_cfg_on_demos(
+                    solver=solver,
+                    cfg=cfg_trial,
+                    demos=demos,
+                    frame_stride=frame_stride,
+                    focus_window=focus_window,
+                )
+                _record_trial(
+                    history,
+                    phase="presearch_axis",
+                    trial_idx=trial_idx,
+                    cfg_trial=cfg_trial,
+                    agg=agg,
+                    rows=rows,
+                    extra={
+                        "stage": axis_name,
+                        "pass": pass_name,
+                        "kind": kind,
+                        "index": int(idx),
+                        "offset": float(offset),
+                    },
+                )
+                trial_idx += 1
+                if float(agg["workspace_score"]) < float(pass_best_metrics["workspace_score"]):
+                    pass_best_cfg = cfg_trial
+                    pass_best_metrics = agg
+                    improved = True
+            best_cfg = pass_best_cfg
+            best_metrics = pass_best_metrics
+            print(
+                f"[PRESEARCH] stage={axis_name} pass={pass_name} best workspace_score={best_metrics['workspace_score']:.4f} "
+                f"first_home={best_metrics['first_frame_home_dist_rad']:.3f} "
+                f"joint3_margin={best_metrics['joint3_margin_min']:.3f} "
+                f"wrist_early={best_metrics['early_wrist_flip_count']:.1f} "
+                f"near_sing={best_metrics['near_singular_ratio']:.3f} "
+                f"improved={int(improved)}",
+                flush=True,
+            )
+
+    rp_span = float(np.deg2rad(args.search_b_rpy_deg))
+    for pass_name, span_scale in [("coarse", 1.0), ("fine", fine_scale)]:
+        center_xyz, center_rpy = _ensure_rpy_node(best_cfg["frames"]["T_B_from_pose_frame"])
+        roll_offsets = np.linspace(-rp_span * span_scale, rp_span * span_scale, rp_steps, dtype=np.float64)
+        pitch_offsets = np.linspace(-rp_span * span_scale, rp_span * span_scale, rp_steps, dtype=np.float64)
+        pass_best_cfg = best_cfg
+        pass_best_metrics = best_metrics
+        improved = False
+        print(
+            f"[PRESEARCH] stage=roll_pitch pass={pass_name} span={rp_span * span_scale:.4f}",
+            flush=True,
+        )
+        for d_roll in roll_offsets:
+            for d_pitch in pitch_offsets:
+                xyz = center_xyz.copy()
+                rpy = center_rpy.copy()
+                rpy[0] = center_rpy[0] + float(d_roll)
+                rpy[1] = center_rpy[1] + float(d_pitch)
+                cfg_trial = _with_base_frame(best_cfg, xyz=xyz, rpy=rpy)
+                rows, agg = evaluate_cfg_on_demos(
+                    solver=solver,
+                    cfg=cfg_trial,
+                    demos=demos,
+                    frame_stride=frame_stride,
+                    focus_window=focus_window,
+                )
+                _record_trial(
+                    history,
+                    phase="presearch_roll_pitch",
+                    trial_idx=trial_idx,
+                    cfg_trial=cfg_trial,
+                    agg=agg,
+                    rows=rows,
+                    extra={
+                        "stage": "roll_pitch",
+                        "pass": pass_name,
+                        "roll_offset_rad": float(d_roll),
+                        "pitch_offset_rad": float(d_pitch),
+                    },
+                )
+                trial_idx += 1
+                if float(agg["workspace_score"]) < float(pass_best_metrics["workspace_score"]):
+                    pass_best_cfg = cfg_trial
+                    pass_best_metrics = agg
+                    improved = True
+        best_cfg = pass_best_cfg
+        best_metrics = pass_best_metrics
+        print(
+            f"[PRESEARCH] stage=roll_pitch pass={pass_name} best workspace_score={best_metrics['workspace_score']:.4f} "
+            f"first_home={best_metrics['first_frame_home_dist_rad']:.3f} "
+            f"joint3_margin={best_metrics['joint3_margin_min']:.3f} "
+            f"near_limit={best_metrics['near_limit_ratio']:.3f} "
+            f"improved={int(improved)}",
+            flush=True,
+        )
+
+    return best_cfg, best_metrics, history
+
+
+def confirm_continue_after_presearch(auto_continue: bool) -> bool:
+    if auto_continue:
+        print("[CONFIRM] auto_continue enabled, continue to refinement.", flush=True)
+        return True
+    try:
+        answer = input("[CONFIRM] Type `yes` to continue with downstream search: ").strip().lower()
+    except EOFError as e:
+        raise RuntimeError(
+            "Interactive confirmation required after presearch. Run in a tty or pass --auto_continue."
+        ) from e
+    if answer != "yes":
+        print("[STOP] Confirmation not received. Exiting after T_B_from_pose_frame presearch.", flush=True)
+        return False
+    return True
 
 
 def main() -> None:
@@ -272,27 +626,79 @@ def main() -> None:
             flush=True,
         )
 
-    # Base parameter vector
-    b_xyz0, b_rpy0 = _ensure_rpy_node(cfg_base["frames"]["T_B_from_pose_frame"])
-    p_xyz0, p_rpy0 = _ensure_rpy_node(cfg_base["frames"]["T_pose_to_tcp"])
-    home0 = np.asarray(cfg_base["selection"].get("home_q_deg", [0.0] * solver.nq), dtype=np.float64)
+    search_frame_stride = max(1, int(args.frame_stride))
+    focus_window = max(1, int(args.presearch_frame_window))
+    rng = np.random.default_rng(int(args.seed))
+    print(
+        f"[SEARCH] seed={args.seed} max_trials={args.max_trials} frame_stride={search_frame_stride} max_demos={args.max_demos}",
+        flush=True,
+    )
+    print(
+        f"[PRESEARCH] order=yaw -> x -> z -> y -> roll/pitch focus_window={focus_window}",
+        flush=True,
+    )
+
+    pre_cfg, pre_metrics, pre_history = run_base_frame_presearch(
+        solver=solver,
+        cfg_start=cfg_base,
+        demos=demos,
+        frame_stride=search_frame_stride,
+        focus_window=focus_window,
+        args=args,
+    )
+    pre_cfg_to_save = copy.deepcopy(pre_cfg)
+    pre_cfg_to_save.pop("config_path", None)
+    pre_cfg_path = out_dir / "presearch_best_config.yaml"
+    dump_yaml(pre_cfg_path, pre_cfg_to_save)
+    pre_metrics_path = out_dir / "presearch_best_metrics.json"
+    with open(pre_metrics_path, "w", encoding="utf-8") as f:
+        json.dump(pre_metrics, f, indent=2, ensure_ascii=False)
+    pre_history_path = out_dir / "presearch_history.json"
+    with open(pre_history_path, "w", encoding="utf-8") as f:
+        json.dump(pre_history, f, indent=2, ensure_ascii=False)
+
+    best_base_frame = pre_cfg["frames"]["T_B_from_pose_frame"]
+    print("[PRESEARCH DONE] Suggested T_B_from_pose_frame:", flush=True)
+    print(json.dumps(best_base_frame, indent=2, ensure_ascii=False), flush=True)
+    print(
+        f"[PRESEARCH DONE] workspace_score={pre_metrics['workspace_score']:.4f} "
+        f"first_home={pre_metrics['first_frame_home_dist_rad']:.3f} "
+        f"joint3_margin={pre_metrics['joint3_margin_min']:.3f} "
+        f"near_limit={pre_metrics['near_limit_ratio']:.3f} "
+        f"near_sing={pre_metrics['near_singular_ratio']:.3f}",
+        flush=True,
+    )
+    print(f"[PRESEARCH DONE] config saved: {pre_cfg_path}", flush=True)
+    print(f"[PRESEARCH DONE] metrics saved: {pre_metrics_path}", flush=True)
+    print(f"[PRESEARCH DONE] history saved: {pre_history_path}", flush=True)
+
+    if not confirm_continue_after_presearch(auto_continue=bool(args.auto_continue)):
+        return
+
+    cfg_seed = copy.deepcopy(pre_cfg)
+
+    # Base parameter vector for post-confirm refinement
+    b_xyz0, b_rpy0 = _ensure_rpy_node(cfg_seed["frames"]["T_B_from_pose_frame"])
+    p_xyz0, p_rpy0 = _ensure_rpy_node(cfg_seed["frames"]["T_pose_to_tcp"])
+    home0 = np.asarray(cfg_seed["selection"].get("home_q_deg", [0.0] * solver.nq), dtype=np.float64)
     if home0.shape[0] != solver.nq:
         home0 = np.zeros((solver.nq,), dtype=np.float64)
 
-    rng = np.random.default_rng(int(args.seed))
-    print(
-        f"[SEARCH] seed={args.seed} max_trials={args.max_trials} frame_stride={args.frame_stride} max_demos={args.max_demos}",
-        flush=True,
+    history: list[dict[str, Any]] = list(pre_history)
+    best_cfg = copy.deepcopy(cfg_seed)
+    _, best_metrics = evaluate_cfg_on_demos(
+        solver=solver,
+        cfg=best_cfg,
+        demos=demos,
+        frame_stride=search_frame_stride,
+        focus_window=focus_window,
     )
-    history: list[dict[str, Any]] = []
-    best_cfg = copy.deepcopy(cfg_base)
-    best_metrics: dict[str, Any] | None = None
     t0 = time.time()
 
     def sample_candidate(trial_idx: int) -> dict:
-        cfg = copy.deepcopy(cfg_base)
+        cfg = copy.deepcopy(cfg_seed)
         if trial_idx == 0:
-            # baseline
+            # baseline after presearch confirmation
             return cfg
 
         # 2-stage random search: first half broad, second half fine around current best
@@ -341,7 +747,7 @@ def main() -> None:
     for trial in range(n_trials):
         trial_t0 = time.time()
         if trial == 0:
-            print(f"[TRIAL {trial+1}/{n_trials}] baseline evaluation...", flush=True)
+            print(f"[TRIAL {trial+1}/{n_trials}] refinement baseline evaluation...", flush=True)
         elif trial % 10 == 0:
             elapsed = time.time() - t0
             avg = elapsed / max(1, trial)
@@ -351,29 +757,21 @@ def main() -> None:
                 flush=True,
             )
         cfg_trial = sample_candidate(trial)
-        rows = []
-        for d in demos:
-            m = summarize_one_demo(
-                solver=solver,
-                cfg=cfg_trial,
-                pose_arr=d["pose"],
-                ts=d["timestamp"],
-                frame_stride=max(1, int(args.frame_stride)),
-            )
-            m["demo_name"] = d["demo_name"]
-            rows.append(m)
-        agg = aggregate_metrics(rows)
-        rec = {
-            "trial": int(trial),
-            "metrics": agg,
-            "per_demo": rows,
-            "frames": {
-                "T_B_from_pose_frame": cfg_trial["frames"]["T_B_from_pose_frame"],
-                "T_pose_to_tcp": cfg_trial["frames"]["T_pose_to_tcp"],
-            },
-            "home_q_deg": cfg_trial["selection"].get("home_q_deg", None),
-        }
-        history.append(rec)
+        rows, agg = evaluate_cfg_on_demos(
+            solver=solver,
+            cfg=cfg_trial,
+            demos=demos,
+            frame_stride=search_frame_stride,
+            focus_window=focus_window,
+        )
+        _record_trial(
+            history,
+            phase="refine",
+            trial_idx=trial,
+            cfg_trial=cfg_trial,
+            agg=agg,
+            rows=rows,
+        )
         trial_dt = time.time() - trial_t0
 
         improved = best_metrics is None or float(agg["score"]) < float(best_metrics["score"])
@@ -382,6 +780,7 @@ def main() -> None:
             best_cfg = cfg_trial
             print(
                 f"[BEST] trial={trial} score={agg['score']:.4f} "
+                f"workspace={agg['workspace_score']:.4f} "
                 f"near_limit={agg['near_limit_ratio']:.3f} "
                 f"branch={agg['branch_switch_count']:.1f} "
                 f"wrist_flip={agg['wrist_flip_count']:.1f} "
@@ -394,6 +793,7 @@ def main() -> None:
             # Show a few early non-best trials to confirm progress.
             print(
                 f"[TRIAL {trial+1}/{n_trials}] score={agg['score']:.4f} "
+                f"workspace={agg['workspace_score']:.4f} "
                 f"near_limit={agg['near_limit_ratio']:.3f} "
                 f"branch={agg['branch_switch_count']:.1f} "
                 f"wrist_flip={agg['wrist_flip_count']:.1f} "
@@ -424,6 +824,7 @@ def main() -> None:
     print(f"[DONE] history: {history_path}", flush=True)
     print(
         f"[DONE] total_time={total_dt:.1f}s best_score={best_metrics['score']:.4f} "
+        f"workspace_score={best_metrics['workspace_score']:.4f} "
         f"near_limit={best_metrics['near_limit_ratio']:.3f} "
         f"branch={best_metrics['branch_switch_count']:.1f} "
         f"wrist_flip={best_metrics.get('wrist_flip_count', 0.0):.1f} "
