@@ -29,6 +29,13 @@ from rm65_offline_replay.math3d import (
 )
 from rm65_offline_replay.pin_solver import PinocchioIKBatchSolver
 
+FIXED_T_B_FROM_POSE_FRAME = {
+    "xyz": [0.11, 0.01, -0.11],
+    "rpy_rad": [-0.6005756692908243, -0.372045004021621, 0.16672589718385517],
+}
+FIXED_HOME_Q_DEG = [-8.46, 20.87, 69.99, -12.00, 44.26, 4.56]
+HOME_Q_MAX_DIFF_DEG = 3.0
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -105,6 +112,16 @@ def _normalize_joint_index(idx_raw: Any, nq: int) -> int | None:
     if idx < 0 or idx >= int(nq):
         return None
     return int(idx)
+
+
+def _fixed_home_anchor_for_nq(nq: int) -> np.ndarray:
+    anchor = np.asarray(FIXED_HOME_Q_DEG, dtype=np.float64)
+    if int(nq) != int(anchor.shape[0]):
+        raise ValueError(
+            f"FIXED_HOME_Q_DEG length={anchor.shape[0]} but robot nq={nq}. "
+            f"Please update FIXED_HOME_Q_DEG to match robot dof."
+        )
+    return anchor
 
 
 def build_targets(
@@ -629,62 +646,33 @@ def main() -> None:
     search_frame_stride = max(1, int(args.frame_stride))
     focus_window = max(1, int(args.presearch_frame_window))
     rng = np.random.default_rng(int(args.seed))
+    fixed_home_anchor = _fixed_home_anchor_for_nq(solver.nq)
+    home_band_deg = min(abs(float(args.search_home_deg)), float(HOME_Q_MAX_DIFF_DEG))
+    home_lo = fixed_home_anchor - home_band_deg
+    home_hi = fixed_home_anchor + home_band_deg
+
+    cfg_base["frames"]["T_B_from_pose_frame"] = copy.deepcopy(FIXED_T_B_FROM_POSE_FRAME)
+    cfg_base["selection"]["home_q_deg"] = [float(x) for x in fixed_home_anchor.tolist()]
+
     print(
         f"[SEARCH] seed={args.seed} max_trials={args.max_trials} frame_stride={search_frame_stride} max_demos={args.max_demos}",
         flush=True,
     )
+    print("[FIXED] T_B_from_pose_frame is locked (no search):", flush=True)
+    print(json.dumps(cfg_base["frames"]["T_B_from_pose_frame"], indent=2, ensure_ascii=False), flush=True)
     print(
-        f"[PRESEARCH] order=yaw -> x -> z -> y -> roll/pitch focus_window={focus_window}",
+        f"[FIXED] home_q anchor(deg)={fixed_home_anchor.tolist()} "
+        f"per-joint bound=+/-{home_band_deg:.2f} deg",
         flush=True,
     )
 
-    pre_cfg, pre_metrics, pre_history = run_base_frame_presearch(
-        solver=solver,
-        cfg_start=cfg_base,
-        demos=demos,
-        frame_stride=search_frame_stride,
-        focus_window=focus_window,
-        args=args,
-    )
-    pre_cfg_to_save = copy.deepcopy(pre_cfg)
-    pre_cfg_to_save.pop("config_path", None)
-    pre_cfg_path = out_dir / "presearch_best_config.yaml"
-    dump_yaml(pre_cfg_path, pre_cfg_to_save)
-    pre_metrics_path = out_dir / "presearch_best_metrics.json"
-    with open(pre_metrics_path, "w", encoding="utf-8") as f:
-        json.dump(pre_metrics, f, indent=2, ensure_ascii=False)
-    pre_history_path = out_dir / "presearch_history.json"
-    with open(pre_history_path, "w", encoding="utf-8") as f:
-        json.dump(pre_history, f, indent=2, ensure_ascii=False)
+    cfg_seed = copy.deepcopy(cfg_base)
 
-    best_base_frame = pre_cfg["frames"]["T_B_from_pose_frame"]
-    print("[PRESEARCH DONE] Suggested T_B_from_pose_frame:", flush=True)
-    print(json.dumps(best_base_frame, indent=2, ensure_ascii=False), flush=True)
-    print(
-        f"[PRESEARCH DONE] workspace_score={pre_metrics['workspace_score']:.4f} "
-        f"first_home={pre_metrics['first_frame_home_dist_rad']:.3f} "
-        f"joint3_margin={pre_metrics['joint3_margin_min']:.3f} "
-        f"near_limit={pre_metrics['near_limit_ratio']:.3f} "
-        f"near_sing={pre_metrics['near_singular_ratio']:.3f}",
-        flush=True,
-    )
-    print(f"[PRESEARCH DONE] config saved: {pre_cfg_path}", flush=True)
-    print(f"[PRESEARCH DONE] metrics saved: {pre_metrics_path}", flush=True)
-    print(f"[PRESEARCH DONE] history saved: {pre_history_path}", flush=True)
-
-    if not confirm_continue_after_presearch(auto_continue=bool(args.auto_continue)):
-        return
-
-    cfg_seed = copy.deepcopy(pre_cfg)
-
-    # Base parameter vector for post-confirm refinement
-    b_xyz0, b_rpy0 = _ensure_rpy_node(cfg_seed["frames"]["T_B_from_pose_frame"])
+    # Base parameter vector for refinement (with fixed base frame)
     p_xyz0, p_rpy0 = _ensure_rpy_node(cfg_seed["frames"]["T_pose_to_tcp"])
-    home0 = np.asarray(cfg_seed["selection"].get("home_q_deg", [0.0] * solver.nq), dtype=np.float64)
-    if home0.shape[0] != solver.nq:
-        home0 = np.zeros((solver.nq,), dtype=np.float64)
+    home0 = fixed_home_anchor.copy()
 
-    history: list[dict[str, Any]] = list(pre_history)
+    history: list[dict[str, Any]] = []
     best_cfg = copy.deepcopy(cfg_seed)
     _, best_metrics = evaluate_cfg_on_demos(
         solver=solver,
@@ -698,7 +686,7 @@ def main() -> None:
     def sample_candidate(trial_idx: int) -> dict:
         cfg = copy.deepcopy(cfg_seed)
         if trial_idx == 0:
-            # baseline after presearch confirmation
+            # baseline with fixed base frame and fixed home anchor
             return cfg
 
         # 2-stage random search: first half broad, second half fine around current best
@@ -706,20 +694,12 @@ def main() -> None:
         fine_scale = 1.0 if frac < 0.5 else 0.35
 
         if best_metrics is not None and frac >= 0.5:
-            b_xyz_c, b_rpy_c = _ensure_rpy_node(best_cfg["frames"]["T_B_from_pose_frame"])
             p_xyz_c, p_rpy_c = _ensure_rpy_node(best_cfg["frames"]["T_pose_to_tcp"])
             home_c = np.asarray(best_cfg["selection"].get("home_q_deg", home0.tolist()), dtype=np.float64)
         else:
-            b_xyz_c, b_rpy_c = b_xyz0, b_rpy0
             p_xyz_c, p_rpy_c = p_xyz0, p_rpy0
             home_c = home0
 
-        b_xyz = b_xyz_c + rng.uniform(
-            -args.search_b_xyz_m * fine_scale, args.search_b_xyz_m * fine_scale, size=3
-        )
-        b_rpy = b_rpy_c + np.deg2rad(
-            rng.uniform(-args.search_b_rpy_deg * fine_scale, args.search_b_rpy_deg * fine_scale, size=3)
-        )
         p_xyz = p_xyz_c + rng.uniform(
             -args.search_pose_tcp_xyz_m * fine_scale, args.search_pose_tcp_xyz_m * fine_scale, size=3
         )
@@ -731,15 +711,18 @@ def main() -> None:
             )
         )
 
-        cfg["frames"]["T_B_from_pose_frame"] = _set_xyz_rpy(cfg["frames"]["T_B_from_pose_frame"], b_xyz, b_rpy)
+        cfg["frames"]["T_B_from_pose_frame"] = copy.deepcopy(FIXED_T_B_FROM_POSE_FRAME)
         if input_pose_represents != "flange":
             cfg["frames"]["T_pose_to_tcp"] = _set_xyz_rpy(cfg["frames"]["T_pose_to_tcp"], p_xyz, p_rpy)
 
         if args.optimize_home_q:
             home = home_c + rng.uniform(
-                -args.search_home_deg * fine_scale, args.search_home_deg * fine_scale, size=solver.nq
+                -home_band_deg * fine_scale, home_band_deg * fine_scale, size=solver.nq
             )
+            home = np.minimum(np.maximum(home, home_lo), home_hi)
             cfg["selection"]["home_q_deg"] = [float(x) for x in home.tolist()]
+        else:
+            cfg["selection"]["home_q_deg"] = [float(x) for x in fixed_home_anchor.tolist()]
 
         return cfg
 
