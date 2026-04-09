@@ -124,6 +124,32 @@ def _fixed_home_anchor_for_nq(nq: int) -> np.ndarray:
     return anchor
 
 
+def _first_frame_home_hard_check(
+    q: np.ndarray,
+    home_q_rad: np.ndarray,
+    max_diff_deg: float,
+) -> dict[str, Any]:
+    band_rad = float(np.deg2rad(max_diff_deg))
+    if q.ndim != 2 or q.shape[0] == 0:
+        return {
+            "first_frame_within_home_hard_band": False,
+            "first_frame_home_hard_violation_count": int(home_q_rad.shape[0]),
+            "first_frame_home_hard_max_excess_rad": float("inf"),
+            "first_frame_home_hard_max_excess_deg": float("inf"),
+            "first_frame_home_joint_abs_diff_deg": [],
+        }
+
+    first_abs_diff_rad = np.abs(q[0] - home_q_rad)
+    excess_rad = np.maximum(first_abs_diff_rad - band_rad, 0.0)
+    return {
+        "first_frame_within_home_hard_band": bool(np.all(first_abs_diff_rad <= band_rad)),
+        "first_frame_home_hard_violation_count": int(np.count_nonzero(first_abs_diff_rad > band_rad)),
+        "first_frame_home_hard_max_excess_rad": float(np.max(excess_rad)),
+        "first_frame_home_hard_max_excess_deg": float(np.rad2deg(np.max(excess_rad))),
+        "first_frame_home_joint_abs_diff_deg": [float(x) for x in np.rad2deg(first_abs_diff_rad).tolist()],
+    }
+
+
 def build_targets(
     pose_arr: np.ndarray,
     cfg: dict,
@@ -169,6 +195,7 @@ def summarize_one_demo(
     ts: np.ndarray,
     frame_stride: int,
     focus_window: int,
+    home_hard_max_diff_deg: float,
 ) -> dict[str, Any]:
     if frame_stride > 1:
         pose_arr = pose_arr[::frame_stride]
@@ -185,6 +212,7 @@ def summarize_one_demo(
     joint_step_max = float(np.max(np.abs(np.diff(q, axis=0)))) if len(q) > 1 else 0.0
     home_q = np.asarray(ik_out.get("home_q_rad", np.zeros((solver.nq,), dtype=np.float64)), dtype=np.float64)
     q_dist_home = np.linalg.norm(q - home_q[None, :], axis=1) if len(q) > 0 else np.zeros((0,), dtype=np.float64)
+    first_frame_home_hard = _first_frame_home_hard_check(q=q, home_q_rad=home_q, max_diff_deg=home_hard_max_diff_deg)
     early_n = max(1, min(int(focus_window), int(len(q)))) if len(q) > 0 else 0
     early_slice = slice(0, early_n)
 
@@ -257,6 +285,11 @@ def summarize_one_demo(
         "early_joint3_strict_violation_ratio": float(np.mean(joint3_strict_violation[early_slice])) if early_n > 0 else 0.0,
         "early_wrist_flip_count": float(np.sum(wrist_flip_flags[early_slice])) if early_n > 0 else 0.0,
         "early_branch_count": float(np.sum(branch_flags[early_slice])) if early_n > 0 else 0.0,
+        "first_frame_within_home_hard_band": bool(first_frame_home_hard["first_frame_within_home_hard_band"]),
+        "first_frame_home_hard_violation_count": int(first_frame_home_hard["first_frame_home_hard_violation_count"]),
+        "first_frame_home_hard_max_excess_rad": float(first_frame_home_hard["first_frame_home_hard_max_excess_rad"]),
+        "first_frame_home_hard_max_excess_deg": float(first_frame_home_hard["first_frame_home_hard_max_excess_deg"]),
+        "first_frame_home_joint_abs_diff_deg": first_frame_home_hard["first_frame_home_joint_abs_diff_deg"],
     }
     return out
 
@@ -264,6 +297,12 @@ def summarize_one_demo(
 def score_metrics(m: dict[str, Any]) -> float:
     # Lower is better.
     # Priority: avoid limit/switch/flicker first, then improve geometric consistency.
+    if not bool(m.get("first_frame_within_home_hard_band", False)):
+        return float(
+            1.0e6
+            + 1.0e4 * float(m.get("first_frame_home_hard_violation_count", 0.0))
+            + 1.0e3 * float(m.get("first_frame_home_hard_max_excess_deg", 0.0))
+        )
     score = 0.0
     score += 8.0 * float(m["near_limit_ratio"])
     score += 2.5 * min(float(m["branch_switch_count"]) / 5.0, 1.0)
@@ -283,6 +322,12 @@ def score_metrics(m: dict[str, Any]) -> float:
 
 def score_workspace_metrics(m: dict[str, Any]) -> float:
     # Lower is better. Prioritize "comfortable working region" before later fine tuning.
+    if not bool(m.get("first_frame_within_home_hard_band", False)):
+        return float(
+            1.0e6
+            + 1.0e4 * float(m.get("first_frame_home_hard_violation_count", 0.0))
+            + 1.0e3 * float(m.get("first_frame_home_hard_max_excess_deg", 0.0))
+        )
     score = 0.0
     score += 4.5 * min(float(m.get("first_frame_home_dist_rad", 0.0)) / 0.60, 3.0)
     score += 2.5 * min(float(m.get("early_home_mean_rad", 0.0)) / 0.75, 3.0)
@@ -339,15 +384,21 @@ def aggregate_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "early_joint3_strict_violation_ratio",
         "early_wrist_flip_count",
         "early_branch_count",
+        "first_frame_within_home_hard_band",
+        "first_frame_home_hard_violation_count",
+        "first_frame_home_hard_max_excess_rad",
+        "first_frame_home_hard_max_excess_deg",
     ]
     out: dict[str, Any] = {}
     for k in keys:
         vals = np.asarray([float(r[k]) for r in rows], dtype=np.float64)
-        if k in {"branch_switch_count", "post_stabilize_fix_count", "wrist_flip_count", "early_wrist_flip_count", "early_branch_count"}:
+        if k == "first_frame_within_home_hard_band":
+            out[k] = bool(np.all(vals > 0.5))
+        elif k in {"branch_switch_count", "post_stabilize_fix_count", "wrist_flip_count", "early_wrist_flip_count", "early_branch_count", "first_frame_home_hard_violation_count"}:
             out[k] = float(np.sum(vals))
         elif k in {"limit_margin_min", "sigma_min_min", "joint3_margin_min", "early_joint3_margin_min", "first_frame_limit_margin", "first_frame_sigma_min"}:
             out[k] = float(np.min(vals))
-        elif k in {"joint_step_max_rad", "pos_err_max", "rot_err_deg_max"}:
+        elif k in {"joint_step_max_rad", "pos_err_max", "rot_err_deg_max", "first_frame_home_hard_max_excess_rad", "first_frame_home_hard_max_excess_deg"}:
             out[k] = float(np.max(vals))
         else:
             out[k] = float(np.mean(vals))
@@ -371,6 +422,7 @@ def evaluate_cfg_on_demos(
     demos: list[dict[str, Any]],
     frame_stride: int,
     focus_window: int,
+    home_hard_max_diff_deg: float,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for d in demos:
@@ -381,6 +433,7 @@ def evaluate_cfg_on_demos(
             ts=d["timestamp"],
             frame_stride=frame_stride,
             focus_window=focus_window,
+            home_hard_max_diff_deg=home_hard_max_diff_deg,
         )
         m["demo_name"] = d["demo_name"]
         rows.append(m)
@@ -436,6 +489,7 @@ def run_base_frame_presearch(
         demos=demos,
         frame_stride=frame_stride,
         focus_window=focus_window,
+        home_hard_max_diff_deg=HOME_Q_MAX_DIFF_DEG,
     )
     best_cfg = copy.deepcopy(cfg_start)
     _record_trial(
@@ -680,6 +734,7 @@ def main() -> None:
         demos=demos,
         frame_stride=search_frame_stride,
         focus_window=focus_window,
+        home_hard_max_diff_deg=HOME_Q_MAX_DIFF_DEG,
     )
     t0 = time.time()
 
@@ -762,7 +817,7 @@ def main() -> None:
             best_metrics = agg
             best_cfg = cfg_trial
             print(
-                f"[BEST] trial={trial} score={agg['score']:.4f} "
+                f"[BEST] trial={trial} score={agg['score']:.4f} hard_ok={int(bool(agg['first_frame_within_home_hard_band']))} excess_deg={agg['first_frame_home_hard_max_excess_deg']:.2f} "
                 f"workspace={agg['workspace_score']:.4f} "
                 f"near_limit={agg['near_limit_ratio']:.3f} "
                 f"branch={agg['branch_switch_count']:.1f} "
@@ -775,7 +830,7 @@ def main() -> None:
         elif trial < 3:
             # Show a few early non-best trials to confirm progress.
             print(
-                f"[TRIAL {trial+1}/{n_trials}] score={agg['score']:.4f} "
+                f"[TRIAL {trial+1}/{n_trials}] score={agg['score']:.4f} hard_ok={int(bool(agg['first_frame_within_home_hard_band']))} excess_deg={agg['first_frame_home_hard_max_excess_deg']:.2f} "
                 f"workspace={agg['workspace_score']:.4f} "
                 f"near_limit={agg['near_limit_ratio']:.3f} "
                 f"branch={agg['branch_switch_count']:.1f} "
