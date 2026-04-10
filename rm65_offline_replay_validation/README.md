@@ -15,6 +15,7 @@ rm65_offline_replay_validation/
     rm65_default.yaml
   scripts/
     run_offline_validation.py
+    visualize_first_frame_alignment.py
     optimize_mapping_params.py
     replay_mujoco.py
   src/rm65_offline_replay/
@@ -101,7 +102,26 @@ python scripts/run_offline_validation.py \
 全局汇总：
 - `global_summary.json`
 
-4.5 参数搜索（推荐先做）
+4.5 两阶段流程（推荐）
+
+先做第一阶段：确认 `T_B_from_pose_frame` 是否把首帧法兰姿态正确映射到 base 坐标系。
+
+```bash
+python scripts/visualize_first_frame_alignment.py \
+  --config configs/rm65_default.yaml \
+  --session_dir <你的session目录> \
+  --demo_index 0 \
+  --frame_index 0 \
+  --output_dir <首帧可视化输出目录>
+```
+
+输出：
+- `*_flange_axes.mp4`：首帧静态视频，法兰坐标轴颜色为 `X=红, Y=绿, Z=蓝`
+- `*_alignment_debug.json`：首帧目标/IK结果/误差明细
+
+第二阶段：固定你在 config 中给定的 `T_B_from_pose_frame`，再做搜索。
+
+注意：当 `robot.input_pose_represents=flange` 时，`T_pose_to_tcp` 不参与搜索；这时建议开启 `--optimize_home_q`。
 
 ```bash
 python scripts/optimize_mapping_params.py \
@@ -110,7 +130,8 @@ python scripts/optimize_mapping_params.py \
   --output_dir <优化输出目录> \
   --max_trials 120 \
   --frame_stride 2 \
-  --max_demos 2
+  --max_demos 2 \
+  --optimize_home_q
 ```
 
 优化输出：
@@ -169,7 +190,8 @@ python scripts/optimize_mapping_params.py \
   --output_dir /home/icrlab/tactile_work_Wy/data/grip_red/batch_3/demos/optimize \
   --max_trials 120 \
   --frame_stride 2 \
-  --max_demos 2
+  --max_demos 2 \
+  --optimize_home_q
 
 python scripts/run_offline_validation.py \
   --config /home/icrlab/tactile_work_Wy/data/grip_red/batch_3/demos/optimize/best_config.yaml \

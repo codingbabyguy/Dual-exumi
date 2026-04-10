@@ -29,11 +29,6 @@ from rm65_offline_replay.math3d import (
 )
 from rm65_offline_replay.pin_solver import PinocchioIKBatchSolver
 
-FIXED_T_B_FROM_POSE_FRAME = {
-    "xyz": [0.11, 0.01, -0.11],
-    "rpy_rad": [-0.6005756692908243, -0.372045004021621, 0.16672589718385517],
-}
-FIXED_HOME_Q_DEG = [-8.46, 20.87, 69.99, -12.00, 44.26, 4.56]
 HOME_Q_MAX_DIFF_DEG = 3.0
 
 
@@ -114,14 +109,14 @@ def _normalize_joint_index(idx_raw: Any, nq: int) -> int | None:
     return int(idx)
 
 
-def _fixed_home_anchor_for_nq(nq: int) -> np.ndarray:
-    anchor = np.asarray(FIXED_HOME_Q_DEG, dtype=np.float64)
-    if int(nq) != int(anchor.shape[0]):
+def _home_anchor_from_cfg(cfg: dict, nq: int) -> np.ndarray:
+    home_q_deg = cfg.get("selection", {}).get("home_q_deg", None)
+    if not isinstance(home_q_deg, list) or len(home_q_deg) != int(nq):
         raise ValueError(
-            f"FIXED_HOME_Q_DEG length={anchor.shape[0]} but robot nq={nq}. "
-            f"Please update FIXED_HOME_Q_DEG to match robot dof."
+            f"selection.home_q_deg must be a list of length nq={nq}, "
+            f"got {home_q_deg!r}."
         )
-    return anchor
+    return np.asarray(home_q_deg, dtype=np.float64)
 
 
 def _first_frame_home_hard_check(
@@ -546,6 +541,7 @@ def run_base_frame_presearch(
                     demos=demos,
                     frame_stride=frame_stride,
                     focus_window=focus_window,
+                    home_hard_max_diff_deg=HOME_Q_MAX_DIFF_DEG,
                 )
                 _record_trial(
                     history,
@@ -604,6 +600,7 @@ def run_base_frame_presearch(
                     demos=demos,
                     frame_stride=frame_stride,
                     focus_window=focus_window,
+                    home_hard_max_diff_deg=HOME_Q_MAX_DIFF_DEG,
                 )
                 _record_trial(
                     history,
@@ -700,31 +697,39 @@ def main() -> None:
     search_frame_stride = max(1, int(args.frame_stride))
     focus_window = max(1, int(args.presearch_frame_window))
     rng = np.random.default_rng(int(args.seed))
-    fixed_home_anchor = _fixed_home_anchor_for_nq(solver.nq)
+    home_anchor = _home_anchor_from_cfg(cfg_base, solver.nq)
     home_band_deg = min(abs(float(args.search_home_deg)), float(HOME_Q_MAX_DIFF_DEG))
-    home_lo = fixed_home_anchor - home_band_deg
-    home_hi = fixed_home_anchor + home_band_deg
-
-    cfg_base["frames"]["T_B_from_pose_frame"] = copy.deepcopy(FIXED_T_B_FROM_POSE_FRAME)
-    cfg_base["selection"]["home_q_deg"] = [float(x) for x in fixed_home_anchor.tolist()]
+    home_lo = home_anchor - home_band_deg
+    home_hi = home_anchor + home_band_deg
 
     print(
         f"[SEARCH] seed={args.seed} max_trials={args.max_trials} frame_stride={search_frame_stride} max_demos={args.max_demos}",
         flush=True,
     )
-    print("[FIXED] T_B_from_pose_frame is locked (no search):", flush=True)
+    print("[FIXED] T_B_from_pose_frame from config (locked, no search):", flush=True)
     print(json.dumps(cfg_base["frames"]["T_B_from_pose_frame"], indent=2, ensure_ascii=False), flush=True)
     print(
-        f"[FIXED] home_q anchor(deg)={fixed_home_anchor.tolist()} "
+        f"[FIXED] home_q anchor(deg)={home_anchor.tolist()} "
         f"per-joint bound=+/-{home_band_deg:.2f} deg",
         flush=True,
     )
 
     cfg_seed = copy.deepcopy(cfg_base)
+    search_pose_tcp_enabled = input_pose_represents != "flange"
+    search_home_enabled = bool(args.optimize_home_q)
+    if not search_pose_tcp_enabled and not search_home_enabled:
+        raise ValueError(
+            "No active search dimension: robot.input_pose_represents=flange disables "
+            "T_pose_to_tcp search. Please enable --optimize_home_q for stage-2 search."
+        )
+    print(
+        f"[SEARCH] active dims: pose_to_tcp={int(search_pose_tcp_enabled)} home_q={int(search_home_enabled)}",
+        flush=True,
+    )
 
     # Base parameter vector for refinement (with fixed base frame)
     p_xyz0, p_rpy0 = _ensure_rpy_node(cfg_seed["frames"]["T_pose_to_tcp"])
-    home0 = fixed_home_anchor.copy()
+    home0 = home_anchor.copy()
 
     history: list[dict[str, Any]] = []
     best_cfg = copy.deepcopy(cfg_seed)
@@ -748,36 +753,33 @@ def main() -> None:
         frac = trial_idx / max(1.0, float(args.max_trials - 1))
         fine_scale = 1.0 if frac < 0.5 else 0.35
 
-        if best_metrics is not None and frac >= 0.5:
-            p_xyz_c, p_rpy_c = _ensure_rpy_node(best_cfg["frames"]["T_pose_to_tcp"])
-            home_c = np.asarray(best_cfg["selection"].get("home_q_deg", home0.tolist()), dtype=np.float64)
-        else:
-            p_xyz_c, p_rpy_c = p_xyz0, p_rpy0
-            home_c = home0
-
-        p_xyz = p_xyz_c + rng.uniform(
-            -args.search_pose_tcp_xyz_m * fine_scale, args.search_pose_tcp_xyz_m * fine_scale, size=3
-        )
-        p_rpy = p_rpy_c + np.deg2rad(
-            rng.uniform(
-                -args.search_pose_tcp_rpy_deg * fine_scale,
-                args.search_pose_tcp_rpy_deg * fine_scale,
-                size=3,
+        if search_pose_tcp_enabled:
+            if best_metrics is not None and frac >= 0.5:
+                p_xyz_c, p_rpy_c = _ensure_rpy_node(best_cfg["frames"]["T_pose_to_tcp"])
+            else:
+                p_xyz_c, p_rpy_c = p_xyz0, p_rpy0
+            p_xyz = p_xyz_c + rng.uniform(
+                -args.search_pose_tcp_xyz_m * fine_scale, args.search_pose_tcp_xyz_m * fine_scale, size=3
             )
-        )
-
-        cfg["frames"]["T_B_from_pose_frame"] = copy.deepcopy(FIXED_T_B_FROM_POSE_FRAME)
-        if input_pose_represents != "flange":
+            p_rpy = p_rpy_c + np.deg2rad(
+                rng.uniform(
+                    -args.search_pose_tcp_rpy_deg * fine_scale,
+                    args.search_pose_tcp_rpy_deg * fine_scale,
+                    size=3,
+                )
+            )
             cfg["frames"]["T_pose_to_tcp"] = _set_xyz_rpy(cfg["frames"]["T_pose_to_tcp"], p_xyz, p_rpy)
 
-        if args.optimize_home_q:
+        if search_home_enabled:
+            if best_metrics is not None and frac >= 0.5:
+                home_c = np.asarray(best_cfg["selection"].get("home_q_deg", home0.tolist()), dtype=np.float64)
+            else:
+                home_c = home0
             home = home_c + rng.uniform(
                 -home_band_deg * fine_scale, home_band_deg * fine_scale, size=solver.nq
             )
             home = np.minimum(np.maximum(home, home_lo), home_hi)
             cfg["selection"]["home_q_deg"] = [float(x) for x in home.tolist()]
-        else:
-            cfg["selection"]["home_q_deg"] = [float(x) for x in fixed_home_anchor.tolist()]
 
         return cfg
 
@@ -801,6 +803,7 @@ def main() -> None:
             demos=demos,
             frame_stride=search_frame_stride,
             focus_window=focus_window,
+            home_hard_max_diff_deg=HOME_Q_MAX_DIFF_DEG,
         )
         _record_trial(
             history,
