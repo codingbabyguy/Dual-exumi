@@ -12,6 +12,12 @@ frames:
     xyz: [0.0, 0.0, 0.0]
     rpy_rad: [0.0, 0.0, 0.0]
 
+  # Optional: measured pose frame -> true flange frame correction.
+  # Keep identity when the collected pose is already flange-aligned.
+  T_pose_to_flange:
+    xyz: [0.0, 0.0, 0.0]
+    rpy_rad: [0.0, 0.0, 0.0]
+
   # input pose -> policy tcp
   # If aligned_arcap_poses.json already stores TCP pose, keep identity.
   T_pose_to_tcp:

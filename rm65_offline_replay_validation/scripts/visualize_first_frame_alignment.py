@@ -130,17 +130,20 @@ def _build_target_one(pose7: np.ndarray, cfg: dict) -> tuple[np.ndarray, np.ndar
         raise ValueError(f"robot.solve_frame must be flange|tcp, got {solve_frame}")
 
     T_B_from_pose = transform_from_cfg(frames_cfg["T_B_from_pose_frame"])
+    T_pose_to_flange = transform_from_cfg(
+        frames_cfg.get("T_pose_to_flange", {"xyz": [0.0, 0.0, 0.0], "rpy_rad": [0.0, 0.0, 0.0]})
+    )
     T_pose_to_tcp = transform_from_cfg(frames_cfg["T_pose_to_tcp"])
     T_flange_to_tcp = transform_from_cfg(frames_cfg["T_flange_to_tcp"])
-    T_pose_to_flange = transform_inverse(T_flange_to_tcp)
+    T_tcp_to_flange = transform_inverse(T_flange_to_tcp)
 
     T_pose = pose7_to_matrix(pose7)
     if input_pose_represents == "flange":
-        T_B_flange = compose(T_B_from_pose, T_pose)
+        T_B_flange = compose(compose(T_B_from_pose, T_pose), T_pose_to_flange)
         T_B_tcp = compose(T_B_flange, T_flange_to_tcp)
     else:
         T_B_tcp = compose(compose(T_B_from_pose, T_pose), T_pose_to_tcp)
-        T_B_flange = compose(T_B_tcp, T_pose_to_flange)
+        T_B_flange = compose(T_B_tcp, T_tcp_to_flange)
 
     if solve_frame == "flange":
         T_B_solve = T_B_flange

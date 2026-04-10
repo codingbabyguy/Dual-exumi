@@ -47,6 +47,7 @@ rm65_offline_replay_validation/
 
 配置中三个变换：
 - `T_B_from_pose_frame`: 输入位姿坐标系 -> 机器人 base
+- `T_pose_to_flange`: 采集pose坐标系 -> 法兰坐标系（可选，常用于轴定义补偿）
 - `T_pose_to_tcp`: 输入位姿 -> 策略TCP
 - `T_flange_to_tcp`: 法兰 -> TCP（默认填了 RM-65 flange xacro 值）
 
@@ -77,6 +78,7 @@ pip install -r requirements-server.txt
 - `robot.ee_frame_name`
 - `robot.input_pose_represents`（若采集的是法兰pose，设为 `flange`）
 - `frames.T_B_from_pose_frame`
+- `frames.T_pose_to_flange`（若采集pose轴定义与真实法兰轴不一致）
 - `frames.T_pose_to_tcp`
 - `frames.T_flange_to_tcp`
 - `selection.home_q_deg`（标准初始位形，单位度）

@@ -20,6 +20,12 @@ DEFAULT_CONFIG = {
             "xyz": [0.0, 0.0, 0.0],
             "rpy_rad": [0.0, 0.0, 0.0],
         },
+        # Optional correction when input_pose_represents=flange:
+        # measured pose frame -> true flange frame.
+        "T_pose_to_flange": {
+            "xyz": [0.0, 0.0, 0.0],
+            "rpy_rad": [0.0, 0.0, 0.0],
+        },
         "T_pose_to_tcp": {
             "xyz": [0.0, 0.0, 0.0],
             "rpy_rad": [0.0, 0.0, 0.0],
