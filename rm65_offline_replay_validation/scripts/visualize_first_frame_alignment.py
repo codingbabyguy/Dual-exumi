@@ -181,6 +181,46 @@ def _add_axis_markers(
     axis_length_m: float,
     axis_radius_m: float,
 ) -> None:
+    def _call_connector(
+        geom: Any,
+        radius_m: float,
+        start_xyz: np.ndarray,
+        end_xyz: np.ndarray,
+    ) -> None:
+        fn = getattr(mujoco, "mjv_makeConnector", None)
+        if fn is None:
+            fn = getattr(mujoco, "mjv_connector", None)
+        if fn is None:
+            raise RuntimeError(
+                "MuJoCo python API missing connector function: "
+                "expected mjv_makeConnector or mjv_connector."
+            )
+        sx, sy, sz = [float(x) for x in np.asarray(start_xyz, dtype=np.float64).reshape(3)]
+        ex, ey, ez = [float(x) for x in np.asarray(end_xyz, dtype=np.float64).reshape(3)]
+        try:
+            # Most bindings: (geom, type, width, from_x, from_y, from_z, to_x, to_y, to_z)
+            fn(
+                geom,
+                mujoco.mjtGeom.mjGEOM_CAPSULE,
+                float(radius_m),
+                sx,
+                sy,
+                sz,
+                ex,
+                ey,
+                ez,
+            )
+            return
+        except TypeError:
+            # Some bindings may expose vector endpoints.
+            fn(
+                geom,
+                mujoco.mjtGeom.mjGEOM_CAPSULE,
+                float(radius_m),
+                np.asarray([sx, sy, sz], dtype=np.float64),
+                np.asarray([ex, ey, ez], dtype=np.float64),
+            )
+
     colors = np.asarray(
         [
             [1.0, 0.15, 0.15, 1.0],  # X: red
@@ -208,16 +248,11 @@ def _add_axis_markers(
             eye9,
             colors[axis],
         )
-        mujoco.mjv_makeConnector(
-            geom,
-            mujoco.mjtGeom.mjGEOM_CAPSULE,
-            float(axis_radius_m),
-            float(origin[0]),
-            float(origin[1]),
-            float(origin[2]),
-            float(end[0]),
-            float(end[1]),
-            float(end[2]),
+        _call_connector(
+            geom=geom,
+            radius_m=float(axis_radius_m),
+            start_xyz=origin,
+            end_xyz=end,
         )
         scene.ngeom += 1
 
